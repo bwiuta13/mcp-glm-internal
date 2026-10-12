@@ -7,7 +7,12 @@ export const TaskListSchema = z.object({
         // Chỉ ép SỐ về chuỗi (đã quan sát glm-5.2 trả id kiểu số). Ép mọi thứ sẽ
         // biến null thành "null" và object thành "[object Object]" — mà id này đi
         // thẳng vào tên thư mục log `task-<id>` và bộ lọc `only` của Task 5.
-        id: z.preprocess((v) => (typeof v === 'number' ? String(v) : v), z.string().min(1)),
+        // Ràng buộc bộ ký tự, không chỉ "chuỗi không rỗng": Task 5 dựng tên thư mục
+        // log `task-<id>`, nên "../../../x" hay "a/b" sẽ thoát ra ngoài thư mục job.
+        id: z.preprocess(
+          (v) => (typeof v === 'number' ? String(v) : v),
+          z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+        ),
         title: z.string().min(1),
         detail: z.string().min(1),
         files: z.array(z.string()),
@@ -66,6 +71,7 @@ export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractRes
     let depth = 0;
     let inString = false;
     let escaped = false;
+    let closed = false;
     for (let j = i; j < text.length; j++) {
       const c = text[j];
       if (inString) {
@@ -81,16 +87,24 @@ export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractRes
       } else if (c === close) {
         depth--;
         if (depth === 0) {
+          closed = true;
           try {
             data = JSON.parse(text.slice(i, j + 1));
             found = true;
           } catch {
-            // span này không parse được — thử điểm mở tiếp theo
+            // Span cân bằng nhưng không phải JSON: bỏ qua CẢ span. Thử lại từng dấu mở
+            // bên trong nó vừa cho chẩn đoán sai — một mảnh con parse được sẽ thắng, và
+            // câu sửa đi nói về mảnh con thay vì nói về lỗi cú pháp thật — vừa làm vòng
+            // quét thành O(n^2).
+            i = j;
           }
           break;
         }
       }
     }
+    // Dấu mở không bao giờ đóng (payload bị cắt cụt): mọi dấu mở phía sau đều nằm bên
+    // trong nó, quét tiếp chỉ tốn thời gian mà không đổi kết quả.
+    if (!closed) break;
   }
 
   if (!found) {

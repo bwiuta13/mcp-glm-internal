@@ -131,3 +131,66 @@ test('review có file và line null thì vẫn chấp nhận', () => {
   const r = parseContract(raw, ReviewSchema);
   assert.equal(r.ok, true);
 });
+
+// --- Ghim bộ đếm độ sâu: mọi ca dưới đây đều bọc prose để ép đi vào nhánh quét ---
+
+test('ngoặc mở lẻ trong chuỗi không phá bộ đếm độ sâu', () => {
+  const task = { ...ONE_TASK.tasks[0], detail: 'function f() { return 1;' };
+  const r = parseContract('Kế hoạch:\n' + JSON.stringify({ tasks: [task] }) + '\nXong.', TaskListSchema);
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.value.tasks[0].detail, 'function f() { return 1;');
+});
+
+test('dấu nháy escape rồi ngoặc trong chuỗi vẫn bóc đúng', () => {
+  const task = { ...ONE_TASK.tasks[0], detail: 'print("{")' };
+  const r = parseContract('Đây:\n' + JSON.stringify({ tasks: [task] }) + '\nHết.', TaskListSchema);
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.value.tasks[0].detail, 'print("{")');
+});
+
+test('backslash ngay trước dấu đóng chuỗi không bị tính nhầm là escape', () => {
+  const task = { ...ONE_TASK.tasks[0], detail: 'C:\\temp\\', acceptance: 'ok {' };
+  const r = parseContract('Đây:\n' + JSON.stringify({ tasks: [task] }) + '\nHết.', TaskListSchema);
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.value.tasks[0].detail, 'C:\\temp\\');
+});
+
+test('câu sửa mang theo lỗi cú pháp thật của V8', () => {
+  const r = parseContract('xin loi toi khong biet', TaskListSchema);
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.repairPrompt, /Unexpected token/);
+});
+
+test('JSON hỏng mà bên trong có mảnh parse được thì vẫn báo lỗi cú pháp', () => {
+  // Xuống dòng THÔ trong chuỗi — lỗi hay gặp nhất khi model viết code vào JSON.
+  // Không có bản vá, mảnh `["a.ts"]` sẽ thắng và câu sửa đi nói về mảng thay vì cú pháp.
+  const NL = String.fromCharCode(10);
+  const raw =
+    '{"tasks": [{"id": "1", "title": "t", "detail": "a' + NL +
+    'b", "files": ["a.ts"], "acceptance": "ok"}]}';
+  const r = parseContract(raw, TaskListSchema);
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.repairPrompt, /not valid JSON/);
+});
+
+test('payload cắt cụt không làm vòng quét chạy quá lâu', () => {
+  const started = Date.now();
+  const r = parseContract('{'.repeat(40000), TaskListSchema);
+  assert.equal(r.ok, false);
+  assert.ok(Date.now() - started < 1000, 'quét 40k dấu mở lẽ ra phải tuyến tính');
+});
+
+test('id rỗng, object, mảng, boolean, hay chứa đường dẫn đều bị từ chối', () => {
+  for (const bad of ['', {}, [], true, '../../../x', 'a/b']) {
+    const raw = JSON.stringify({ tasks: [{ ...ONE_TASK.tasks[0], id: bad }] });
+    const r = parseContract(raw, TaskListSchema);
+    assert.equal(r.ok, false, `id ${JSON.stringify(bad)} đáng lẽ phải bị từ chối`);
+    if (!r.ok) assert.match(r.repairPrompt, /tasks\.0\.id/);
+  }
+});
+
+test('issue thiếu hẳn file và line thì vẫn chấp nhận', () => {
+  const raw = JSON.stringify({ verdict: 'fail', issues: [{ severity: 'minor', message: 'x' }] });
+  const r = parseContract(raw, ReviewSchema);
+  assert.equal(r.ok, true);
+});
