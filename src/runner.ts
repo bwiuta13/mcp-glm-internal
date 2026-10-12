@@ -1,11 +1,23 @@
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ROLE_SANDBOX, type Config, type Role } from './config.ts';
 
-/** decision="forbidden" là loại agent không tự vượt qua được. */
+/**
+ * Lá chắn git có HAI lớp độc lập, cả hai đã xác minh bằng cách chạy codex thật:
+ *
+ * 1. execpolicy `decision="forbidden"` — chặn dạng gọi thông thường, kèm thông báo rõ
+ *    ("rejected by the execution environment with the reason `no commit`"). Lớp này
+ *    KHÔNG phủ được dạng có tuỳ chọn toàn cục: `git -c user.name=a commit` và
+ *    `git -C . commit` không khớp prefix rule (execpolicy check trả matchedRules rỗng).
+ * 2. sandbox `workspace-write` — từ chối mọi ghi vào .git bất kể argv dạng gì:
+ *    "fatal: Unable to create '.../.git/index.lock': Operation not permitted".
+ *    Đây mới là chốt chặn thật.
+ *
+ * Vì thế `-s workspace-write` là bắt buộc: `danger-full-access` gỡ CẢ HAI lớp cùng lúc.
+ */
 export const GUARD_RULES =
   'prefix_rule(pattern=["git","commit"], decision="forbidden", justification="Pipeline agent must not commit.")\n' +
   'prefix_rule(pattern=["git","push"], decision="forbidden", justification="Pipeline agent must not push.")\n';
@@ -78,28 +90,59 @@ export function runRole(role: Role, cfg: Config, opts: RunOpts): Promise<RunResu
     env.CODEX_HOME = opts.guardHome;
   } else {
     bin = cfg.binaries.claude!;
-    args.push('-p', '--model', rc.model, '--output-format', 'json', '--add-dir', opts.cwd);
+    // Prompt phải đứng NGAY SAU -p. `--tools <tools...>` của Claude Code là biến thiên,
+    // nên bất cứ thứ gì đứng sau nó đều bị nuốt thành tên tool, và CLI thật báo
+    // "Input must be provided either through stdin or as a prompt argument".
+    args.push('-p', opts.prompt, '--model', rc.model, '--output-format', 'json',
+              '--add-dir', opts.cwd);
     if (rc.effort) args.push('--effort', rc.effort);
-    args.push('--tools', 'Read,Grep,Glob'); // runner claude chỉ dùng cho vai nghĩ
-    args.push(opts.prompt);
+    args.push('--tools', 'Read,Grep,Glob'); // đặt CUỐI vì biến thiên
   }
 
+  // Đọc lại outFile của lượt trước sẽ cho ra lastMessage cũ nếu lượt này không ghi được.
+  rmSync(opts.outFile, { force: true });
+
   return new Promise<RunResult>((resolve) => {
-    const child = spawn(bin, args, { cwd: opts.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // detached: con thành trưởng nhóm tiến trình, nhờ đó giết được CẢ cháu. Không có nó
+    // thì SIGKILL chỉ tới `sh`, còn `sleep` cháu vẫn giữ pipe stdout và 'close' phải đợi
+    // nó — đo thật: hạn 1s nhưng settle ở 8,0s.
+    const child = spawn(bin, args, {
+      cwd: opts.cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+    });
     opts.onSpawn?.(child);
 
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
     }, timeoutMs);
 
-    child.stdout.on('data', (d) => { stdout += String(d); });
-    child.stderr.on('data', (d) => { stderr += String(d); });
+    // setEncoding thay vì String(d) từng chunk: ký tự nhiều byte bị cắt ngang ranh giới
+    // chunk sẽ thành U+FFFD — đo thật 7 ký tự hỏng trên 300KB tiếng Việt.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+
+    // Không có handler này, spawn hỏng (cwd không tồn tại, EACCES, ENOENT) ném
+    // "Unhandled 'error' event" và GIẾT CẢ TIẾN TRÌNH MCP, promise không bao giờ settle.
+    child.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ exitCode: -1, stdout, stderr: stderr + String(e), lastMessage: '', timedOut });
+    });
 
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       let lastMessage = '';
       try {

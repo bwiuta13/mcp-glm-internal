@@ -2,19 +2,32 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { ensureGuardHome } from '../src/runner.ts';
+import { ensureGuardHome, GUARD_RULES } from '../src/runner.ts';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { loadConfig } from '../src/config.ts';
-
-// Lấy đường dẫn codex từ config thật; bỏ qua test nếu máy chưa cấu hình.
-function codexBin(): string | null {
-  try { return loadConfig().binaries.codex; } catch { return null; }
-}
 
 test('rules chặn git commit và git push, cho qua lệnh vô hại', (t) => {
-  const bin = codexBin();
-  if (!bin) return t.skip('chưa có ~/.mcp-coding-glm/config.json');
+  // Giải binary NGAY TẠI ĐÂY, không đi qua config của người dùng. Test này là chuông báo
+  // khi Codex nâng cấp đổi cú pháp rules, nên nó phải chạy được trên một clone sạch —
+  // phụ thuộc vào ~/.mcp-coding-glm/config.json là tự tắt chuông vĩnh viễn.
+  let bin = process.env.CODEX_BIN ?? '';
+  if (!bin) {
+    try {
+      bin = execFileSync('sh', ['-c', 'command -v codex'], { encoding: 'utf8' }).trim();
+    } catch {
+      bin = '';
+    }
+  }
+  if (!bin) {
+    // Trên CI thì thiếu codex là lỗi, không phải lý do bỏ qua.
+    assert.ok(!process.env.CI && !process.env.REQUIRE_CODEX, 'không tìm thấy binary codex');
+    return t.skip('máy này không có codex');
+  }
+
+  // Neo theo dòng: thiếu /m thì một `.*` có thể vắt qua xuống dòng và khớp nhầm chữ
+  // "forbidden" của rule bên cạnh, khiến rule bị hạ xuống "allow" mà test vẫn xanh.
+  assert.match(GUARD_RULES, /^prefix_rule\(pattern=\["git","commit"\], decision="forbidden"/m);
+  assert.match(GUARD_RULES, /^prefix_rule\(pattern=\["git","push"\], decision="forbidden"/m);
 
   const home = ensureGuardHome(mkdtempSync(join(tmpdir(), 'mcg-guard-')));
   const rules = join(home, 'rules', 'guard.rules');
