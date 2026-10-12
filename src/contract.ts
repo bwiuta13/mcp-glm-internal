@@ -4,7 +4,10 @@ export const TaskListSchema = z.object({
   tasks: z
     .array(
       z.object({
-        id: z.coerce.string(),
+        // Chỉ ép SỐ về chuỗi (đã quan sát glm-5.2 trả id kiểu số). Ép mọi thứ sẽ
+        // biến null thành "null" và object thành "[object Object]" — mà id này đi
+        // thẳng vào tên thư mục log `task-<id>` và bộ lọc `only` của Task 5.
+        id: z.preprocess((v) => (typeof v === 'number' ? String(v) : v), z.string().min(1)),
         title: z.string().min(1),
         detail: z.string().min(1),
         files: z.array(z.string()),
@@ -20,8 +23,10 @@ export const ReviewSchema = z.object({
     .array(
       z.object({
         severity: z.enum(['blocker', 'major', 'minor']),
-        file: z.string().optional(),
-        line: z.number().int().optional(),
+        // LLM thường trả null cho field vắng mặt. Từ chối null ở đây tốn nguyên
+        // một lượt reviewer chạy lại, nên nhận cả null lẫn undefined.
+        file: z.string().nullish(),
+        line: z.number().int().nullish(),
         message: z.string(),
       }),
     )
@@ -35,26 +40,64 @@ export type Review = z.infer<typeof ReviewSchema>;
 export type ContractResult<T> = { ok: true; value: T } | { ok: false; repairPrompt: string };
 
 export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractResult<T> {
-  let text = raw.trim();
+  const text = raw.trim();
 
-  // Đã quan sát thật: glm-5.2 trả JSON bọc trong hàng rào markdown.
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fence) {
-    text = fence[1].trim();
-  } else {
-    const start = text.search(/[[{]/);
-    const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
-    if (start >= 0 && end > start) text = text.slice(start, end + 1);
-  }
-
+  // Output của model là prose, hàng rào ``` và JSON trộn theo thứ tự bất kỳ — và một
+  // giá trị chuỗi TRONG JSON hoàn toàn có thể chứa khối ``` của chính nó, vì ta bảo
+  // splitter viết `detail` đủ chi tiết và bảo reviewer viết `guidance`. Nên khớp hàng
+  // rào bằng regex, hay cắt từ dấu mở đầu tới dấu đóng cuối, đều phá hỏng payload hợp lệ.
+  // Thay vào đó: thử cả chuỗi trước, rồi quét tìm span {...} hoặc [...] cân bằng đầu tiên
+  // parse được, với bộ đếm độ sâu biết bỏ qua dấu nằm trong chuỗi.
   let data: unknown;
+  let found = false;
+  let firstError = '';
+
   try {
     data = JSON.parse(text);
+    found = true;
   } catch (e) {
+    firstError = (e as Error).message;
+  }
+
+  for (let i = 0; i < text.length && !found; i++) {
+    const open = text[i];
+    if (open !== '{' && open !== '[') continue;
+    const close = open === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let j = i; j < text.length; j++) {
+      const c = text[j];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') inString = false;
+        continue;
+      }
+      if (c === '"') {
+        inString = true;
+      } else if (c === open) {
+        depth++;
+      } else if (c === close) {
+        depth--;
+        if (depth === 0) {
+          try {
+            data = JSON.parse(text.slice(i, j + 1));
+            found = true;
+          } catch {
+            // span này không parse được — thử điểm mở tiếp theo
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  if (!found) {
     return {
       ok: false,
       repairPrompt:
-        `Your previous reply was not valid JSON (${(e as Error).message}). ` +
+        `Your previous reply was not valid JSON (${firstError}). ` +
         `Reply with JSON only — no prose, no markdown fences.`,
     };
   }
