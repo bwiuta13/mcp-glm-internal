@@ -75,3 +75,29 @@ test('coder không phải runner codex thì từ chối', () => {
   };
   assert.throws(() => loadConfig(writeCfg(bad)), /roles\.coder\.runner must be "codex"/);
 });
+
+test('binary path rỗng thì từ chối', () => {
+  const bad = { ...GOOD, binaries: { codex: '' } };
+  assert.throws(() => loadConfig(writeCfg(bad)), /must be an absolute path/);
+});
+
+test('provider openai không cần khai báo thì chấp nhận', () => {
+  const cfg = loadConfig(writeCfg({
+    binaries: { codex: '/bin/echo' },
+    roles: {
+      splitter: { runner: 'codex', provider: 'openai', model: 'gpt-4' },
+      reviewer: { runner: 'codex', provider: 'openai', model: 'gpt-4' },
+      coder: { runner: 'codex', provider: 'openai', model: 'gpt-4' },
+    },
+  }));
+  assert.ok(cfg);
+});
+
+test('runner claude với provider lạ thì từ chối', () => {
+  const bad = {
+    ...GOOD,
+    binaries: { codex: '/bin/echo', claude: '/bin/echo' },
+    roles: { ...GOOD.roles, reviewer: { runner: 'claude', provider: 'unknown', model: 'sonnet' } },
+  };
+  assert.throws(() => loadConfig(writeCfg(bad)), /is not declared in providers/);
+});

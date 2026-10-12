@@ -68,7 +68,7 @@ export function loadConfig(path: string = DEFAULT_CONFIG_PATH): Config {
 
   // App GUI không kế thừa PATH của shell, nên binary phải tuyệt đối và có thật.
   for (const [name, p] of Object.entries(cfg.binaries)) {
-    if (!p) continue;
+    if (p === undefined) continue;
     if (!p.startsWith('/')) throw new Error(`binaries.${name} must be an absolute path, got: ${p}`);
     if (!existsSync(p)) throw new Error(`binaries.${name} not found on disk: ${p}`);
   }
@@ -82,7 +82,7 @@ export function loadConfig(path: string = DEFAULT_CONFIG_PATH): Config {
     if (rc.runner === 'claude' && !cfg.binaries.claude) {
       throw new Error(`roles.${role}.runner is "claude" but binaries.claude is not configured`);
     }
-    if (rc.runner === 'codex' && rc.provider && rc.provider !== 'openai' && !cfg.providers[rc.provider]) {
+    if (rc.provider && rc.provider !== 'openai' && !cfg.providers[rc.provider]) {
       throw new Error(`roles.${role}.provider "${rc.provider}" is not declared in providers`);
     }
   }
