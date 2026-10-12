@@ -122,6 +122,10 @@ export function runRole(role: Role, cfg: Config, opts: RunOpts): Promise<RunResu
       } catch {
         child.kill('SIGKILL');
       }
+      // Một đứa cháu tự setsid ra khỏi nhóm vẫn giữ pipe và 'close' vẫn phải đợi nó —
+      // đo thật 8,5s cho hạn 1s. Huỷ pipe ở phía ta để thoát hẳn, bất kể nó còn sống.
+      child.stdout.destroy();
+      child.stderr.destroy();
     }, timeoutMs);
 
     // setEncoding thay vì String(d) từng chunk: ký tự nhiều byte bị cắt ngang ranh giới

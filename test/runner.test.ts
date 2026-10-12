@@ -70,8 +70,9 @@ test('quá giờ thì bị giết và đánh dấu timedOut', async () => {
   const elapsed = Date.now() - started;
   delete process.env.FAKE_SLEEP;
   assert.equal(r.timedOut, true);
-  // Không khẳng định hai điều này thì xoá hẳn lệnh kill đi test vẫn xanh.
-  assert.equal(r.exitCode, -1, 'tiến trình con phải bị giết, không được tự thoát 0');
+  // KHÔNG khẳng định exitCode === -1: có đua. Group SIGKILL hạ `sleep` trước, `sh` thức
+  // dậy kịp chạy `exit 0` nên exitCode về 0 khoảng 5-10% số lần. `elapsed` dưới đây đã
+  // đủ giết mọi mutant xoá lệnh kill, một cách tất định.
   assert.ok(elapsed < 3000, `hạn 1s mà settle mất ${elapsed}ms — cháu còn giữ pipe`);
 });
 
@@ -175,10 +176,27 @@ test('outFile của lượt trước bị xoá, không bị đọc nhầm thành
   const { cfg, dir } = cfgWith();
   const out = join(dir, 'o.txt');
   writeFileSync(out, 'KET-QUA-CU');
+  // Phải dùng child KHÔNG ghi -o, nếu không fixture sẽ ghi đè và test xanh kể cả khi
+  // bỏ rmSync — tức là chẳng ghim được gì.
+  process.env.FAKE_NO_WRITE = '1';
   process.env.FAKE_EXIT = '1';
   const r = await runRole('coder', cfg, {
     prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: out,
   });
+  delete process.env.FAKE_NO_WRITE;
   delete process.env.FAKE_EXIT;
-  assert.ok(!r.lastMessage.includes('KET-QUA-CU'));
+  assert.equal(r.lastMessage, '', 'phải rỗng, không được là kết quả lượt trước');
+});
+
+test('văn bản tiếng Việt dài không bị hỏng ở ranh giới chunk', async () => {
+  chmodSync(FAKE, 0o755);
+  const { cfg, dir } = cfgWith();
+  process.env.FAKE_BIG_UTF8 = '5000'; // ~250KB, vượt nhiều lần ngưỡng chunk 64KB
+  const r = await runRole('coder', cfg, {
+    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+  });
+  delete process.env.FAKE_BIG_UTF8;
+  assert.ok(r.stdout.length > 100000, `chỉ nhận được ${r.stdout.length} ký tự`);
+  assert.ok(!r.stdout.includes('�'), 'có ký tự hỏng — decode từng chunk rời');
+  assert.match(r.stdout, /ăâêôơưđ ÀÁẠẢÃ/);
 });
