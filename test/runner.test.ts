@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../src/config.ts';
@@ -209,23 +209,50 @@ test('văn bản tiếng Việt dài không bị hỏng ở ranh giới chunk', 
 
 test('quá giờ thì giết cả NHÓM — cháu trong nhóm không được sống sót', async () => {
   chmodSync(FAKE, 0o755);
-  const { cfg, dir } = cfgWith({ timeouts: { splitter: 1, reviewer: 1, coder: 1 } });
+  // Hạn 5s chứ không phải 1s: dưới tải, fixture có thể chưa kịp ghi pid của cháu thì đã
+  // bị SIGKILL, và test đỏ vì ENOENT chứ không phải vì group kill hỏng. Cháu ngủ 30s nên
+  // 5s vẫn phân biệt được rõ giết-theo-nhóm với không giết.
+  const { cfg, dir } = cfgWith({ timeouts: { splitter: 5, reviewer: 5, coder: 5 } });
   const pidFile = join(dir, 'gc.pid');
   process.env.FAKE_GRANDCHILD_PIDFILE = pidFile;
   const started = Date.now();
-  const r = await runRole('coder', cfg, {
+  const pending = runRole('coder', cfg, {
     prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
   });
+
+  // Đọc pid NGAY khi fixture ghi ra, song song với lượt chạy — đọc sau khi runRole kết
+  // thúc là đọc một file mà tiến trình đã bị giết có thể chưa kịp tạo.
+  let pid = 0;
+  const readBy = Date.now() + 20_000;
+  while (Date.now() < readBy && pid <= 0) {
+    if (existsSync(pidFile)) pid = Number(readFileSync(pidFile, 'utf8').trim()) || 0;
+    if (pid <= 0) await new Promise((res) => setTimeout(res, 20));
+  }
+  const r = await pending;
   delete process.env.FAKE_GRANDCHILD_PIDFILE;
+
+  assert.ok(pid > 0, 'fixture không ghi được pid của cháu');
   assert.equal(r.timedOut, true);
-  assert.ok(Date.now() - started < 3000);
-  const pid = Number(readFileSync(pidFile, 'utf8').trim());
-  await new Promise((res) => setTimeout(res, 300)); // nhường nhịp cho kernel dọn
-  assert.throws(
-    () => process.kill(pid, 0),
-    /ESRCH/,
-    `cháu pid ${pid} còn sống — group kill hỏng, agent ghi file thành mồ côi`,
-  );
+  // Nới từ 3s lên 15s: cháu ngủ 30s, nên ngưỡng này vẫn đỏ khi group kill hỏng, mà
+  // không đỏ oan chỉ vì máy đang bận.
+  assert.ok(Date.now() - started < 15_000, `settle mất ${Date.now() - started}ms`);
+
+  // Poll chờ ESRCH thay vì ngủ cứng 300ms: kernel dọn nhanh hay chậm tuỳ tải.
+  let gone = false;
+  const until = Date.now() + 5_000;
+  while (Date.now() < until) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      gone = true;
+      break;
+    }
+    await new Promise((res) => setTimeout(res, 20));
+  }
+  if (!gone) {
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* dọn rác khi test đỏ */ }
+  }
+  assert.ok(gone, `cháu pid ${pid} còn sống — group kill hỏng, agent ghi file thành mồ côi`);
 });
 
 test('cháu tự thoát nhóm mà giữ pipe thì vẫn không kéo dài quá hạn', async () => {
