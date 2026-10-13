@@ -113,13 +113,23 @@ This writes a sample config to `~/.mcp-coding-glm/config.json`, copies the three
 skills into `~/.codex/skills/`, and registers the server with `codex mcp add` using
 **absolute paths** (GUI apps don't inherit shell PATH).
 
+Prefer setting it up by hand? Copy [`config.example.json`](config.example.json) to
+`~/.mcp-coding-glm/config.json` and edit it — see the Configuration notes below.
+
 The one secret the server needs is the coder provider's API key, passed through the
 environment — see [`env.example`](env.example) for the variable name and where it
 belongs (`[mcp_servers.coding-glm]` → `env` in `~/.codex/config.toml`).
 
 ## Configuration
 
-Single source of truth: `~/.mcp-coding-glm/config.json`.
+Single source of truth: `~/.mcp-coding-glm/config.json`. A ready-to-edit sample lives at
+[`config.example.json`](config.example.json):
+
+```sh
+mkdir -p ~/.mcp-coding-glm
+cp config.example.json ~/.mcp-coding-glm/config.json
+# rồi sửa đường dẫn binaries cho máy bạn: command -v codex
+```
 
 ```json
 {

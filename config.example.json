@@ -1,0 +1,20 @@
+{
+  "binaries": {
+    "codex": "/absolute/path/to/codex",
+    "claude": "/absolute/path/to/claude"
+  },
+  "providers": {
+    "greennode": {
+      "baseUrl": "https://tokenplan.api.greennode.ai/v1",
+      "apiKeyEnv": "GREENNODE_API_KEY"
+    }
+  },
+  "roles": {
+    "splitter": { "runner": "codex", "provider": "openai", "model": "gpt-5.6-sol" },
+    "reviewer": { "runner": "codex", "provider": "openai", "model": "gpt-5.6-sol" },
+    "coder": { "runner": "codex", "provider": "greennode", "model": "z-ai/glm-5.3" }
+  },
+  "maxRounds": 3,
+  "timeouts": { "splitter": 300, "reviewer": 300, "coder": 900 },
+  "snapshotUntracked": false
+}
