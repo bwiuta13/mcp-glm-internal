@@ -1,6 +1,6 @@
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ROLE_SANDBOX, type Config, type Role } from './config.ts';
@@ -30,6 +30,18 @@ export function ensureGuardHome(root: string = join(homedir(), '.mcp-coding-glm'
   const home = join(root, 'codex-home');
   mkdirSync(join(home, 'rules'), { recursive: true });
   writeFileSync(join(home, 'rules', 'guard.rules'), GUARD_RULES);
+
+  // CODEX_HOME riêng cũng tách luôn phần xác thực: `codex exec --help` ghi rõ "auth still
+  // uses CODEX_HOME". Đo thật với guard home sạch: 401 Unauthorized. Nối auth của người
+  // dùng vào đây, nếu họ có. Không có thì provider `openai` sẽ hỏng và install.sh chọn
+  // preset khác — xem scripts/install.sh.
+  const realAuth = join(homedir(), '.codex', 'auth.json');
+  const linked = join(home, 'auth.json');
+  try {
+    if (existsSync(realAuth) && !existsSync(linked)) symlinkSync(realAuth, linked);
+  } catch {
+    // không nối được thì thôi; nhánh GreenNode dùng env key nên không cần auth.json
+  }
   return home;
 }
 

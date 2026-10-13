@@ -6,13 +6,18 @@ cách. Chỉ bài này nói được điều đó. Chạy sau khi cài, và sau 
 ## 1. Chuẩn bị
 
 ```bash
+rm -rf /tmp/mcg-smoke            # dọn sạch: sum.js còn sót từ lần trước làm bước 5 xanh giả
 mkdir -p /tmp/mcg-smoke && cd /tmp/mcg-smoke
 git init && git commit --allow-empty -m init
+ls ~/.codex/rules/               # ghi lại để bước 5 đối chiếu lá chắn không rò ra ngoài
 ```
 
 ## 2. Kiểm config nạp được
 
+Chạy từ **thư mục repo**, không phải từ `/tmp/mcg-smoke` của bước 1:
+
 ```bash
+cd /Users/lap14568/mcp-coding-glm
 node -e "import('./src/config.ts').then(m=>console.log(JSON.stringify(m.loadConfig(),null,1)))"
 ```
 
@@ -21,10 +26,13 @@ Kỳ vọng: in ra config, không ném lỗi.
 ## 3. Kiểm lá chắn git thật sự áp vào tiến trình con
 
 ```bash
-npm test -- --test-name-pattern "rules chặn git"
+node --test --test-name-pattern="rules chặn git" test/guard.test.ts
 ```
 
-Kỳ vọng: PASS, không `skip`. Nếu `skip` thì chưa có `~/.mcp-coding-glm/config.json`.
+Kỳ vọng: PASS, không `skip`. `npm test -- --test-name-pattern ...` **không lọc được** —
+cờ bị nối sau glob nên Node đưa nó cho chính file test và cả bộ 76 test đều chạy.
+`skip` nghĩa là không tìm thấy binary `codex` (test tự dò qua `CODEX_BIN` hoặc PATH),
+**không** phải thiếu config.
 
 ## 4. Chạy pipeline thật, một task bé
 
@@ -41,8 +49,18 @@ với plan: *"Tạo file sum.js xuất hàm sum(a,b) trả a+b, và sum.test.js 
 - [ ] `pipeline_start` trả `job_id` **ngay**, không treo
 - [ ] `pipeline_status` cho thấy task chuyển `coding` → `reviewing` → `passed`
 - [ ] File thật được tạo trong `/tmp/mcg-smoke`
-- [ ] `git log` **không có commit mới** — lá chắn đã làm việc
-- [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1-<task_id>/round-1.diff` có nội dung
+- [ ] **Kiểm lá chắn git theo kiểu đối nghịch.** Chỉ xem `git log` trống là vô nghĩa:
+      prompt đã bảo coder đừng commit, nên nó không bao giờ thử, và phép kiểm này vẫn
+      xanh kể cả khi lá chắn hỏng hoàn toàn. Phải tự ép nó thử:
+
+      ```bash
+      CODEX_HOME=~/.mcp-coding-glm/codex-home codex exec -s workspace-write \
+        -C /tmp/mcg-smoke --skip-git-repo-check \
+        "Run exactly this and report the output verbatim: git commit --allow-empty -m probe"
+      ```
+
+      Phải thấy lệnh bị từ chối kèm lý do `no commit`, và `git log` chỉ có commit `init`.
+- [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1/round-1.diff` có nội dung
 - [ ] `~/.codex/rules/` **không** bị thêm file nào — lá chắn đúng phạm vi
 
 ## 6. Nếu bước 5 có mục nào hỏng
