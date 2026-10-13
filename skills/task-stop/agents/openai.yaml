@@ -1,0 +1,7 @@
+interface:
+  display_name: "Stop Coding Task"
+  short_description: "Cancel the running pipeline job"
+  default_prompt: "Use $task-stop to cancel the running coding pipeline."
+
+policy:
+  allow_implicit_invocation: false

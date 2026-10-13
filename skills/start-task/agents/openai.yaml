@@ -1,0 +1,7 @@
+interface:
+  display_name: "Start Coding Task"
+  short_description: "Hand the agreed plan to the coding pipeline"
+  default_prompt: "Use $start-task to hand the plan we agreed on to the coding pipeline."
+
+policy:
+  allow_implicit_invocation: false

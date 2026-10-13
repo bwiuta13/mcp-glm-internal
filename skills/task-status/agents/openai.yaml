@@ -1,0 +1,7 @@
+interface:
+  display_name: "Coding Task Status"
+  short_description: "Show progress of the running pipeline"
+  default_prompt: "Use $task-status to show how the coding pipeline is doing."
+
+policy:
+  allow_implicit_invocation: true
