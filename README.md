@@ -45,9 +45,15 @@ Nothing is ever committed or pushed — the repo owner reviews the final diff an
   a timed-out agent cannot leave orphaned grandchildren with file-write access.
 - **Per-cwd lock**: only one job at a time per working directory — in-process and,
   additionally, cross-process via a lock file keyed on the normalized path.
-- **Diff baselines**: before each task, `git diff` is captured to `baseline.diff` so the
-  work can be reverted; optionally (`snapshotUntracked: true`) untracked files are
-  copied aside too.
+- **Tree-snapshot baselines**: before each task the working tree is snapshotted into a
+  git tree object (via a temporary `GIT_INDEX_FILE`, so the real index, status and refs
+  are untouched), and each round's diff is taken between two tree ids. This is deliberate:
+  a plain `git diff` returns **nothing** for a task that only creates new files, drops
+  binary hunks, and breaks under common `git config` settings — and since this pipeline
+  edits in place and never commits, those diffs are the only way to undo anything.
+  Optionally (`snapshotUntracked: true`) untracked files are copied aside as well.
+- **A git work tree is required**: a job in a non-git directory fails immediately, before
+  any agent runs, because there would be no way to recover from it.
 
 ## Requirements
 
