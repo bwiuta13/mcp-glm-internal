@@ -1,0 +1,170 @@
+import { McpServer } from '@modelcontextprotocol/server';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import * as z from 'zod';
+import { existsSync } from 'node:fs';
+import { loadConfig, DEFAULT_CONFIG_PATH, type Config } from './config.ts';
+import { createJob, getJob, cancelJob, readTail } from './jobs.ts';
+import { runPipeline } from './pipeline.ts';
+
+const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
+
+let cached: Config | null = null;
+let configError: string | null = null;
+try {
+  cached = loadConfig();
+} catch (e) {
+  configError = (e as Error).message;
+}
+
+const server = new McpServer({ name: 'mcp-coding-glm', version: '0.1.0' });
+
+server.registerTool(
+  'capabilities',
+  {
+    description:
+      'Report which runners, providers and models are configured for each pipeline role, ' +
+      'and whether their binaries were found. Call this before pipeline_start to know who you are driving.',
+    inputSchema: {},
+  },
+  async () => {
+    if (!cached) return text(`Config not usable.\n${configError}`);
+    const rows = Object.entries(cached.roles).map(([role, rc]) => {
+      const bin = rc.runner === 'codex' ? cached!.binaries.codex : cached!.binaries.claude;
+      return `${role}: runner=${rc.runner} model=${rc.model}` +
+        `${rc.provider ? ` provider=${rc.provider}` : ''}` +
+        ` binary=${bin} ${bin && existsSync(bin) ? 'OK' : 'MISSING'}`;
+    });
+    return text(
+      [`config: ${DEFAULT_CONFIG_PATH}`, `maxRounds: ${cached.maxRounds}`, ...rows].join('\n'),
+    );
+  },
+);
+
+server.registerTool(
+  'pipeline_start',
+  {
+    description:
+      'Start a coding pipeline from an already-agreed plan. Returns a job_id immediately; ' +
+      'the work runs in the background. ' +
+      'ONLY call this when the user has explicitly invoked the $start-task skill. ' +
+      'Never call it on your own initiative, even when a plan looks finished.',
+    inputSchema: {
+      plan: z.string().min(1).describe('The agreed plan, as text'),
+      cwd: z.string().min(1).describe('Absolute path of the project directory to work in'),
+      maxRounds: z.number().int().positive().optional().describe('Override code→review rounds'),
+      only: z.array(z.string()).optional().describe('Run only these task ids after splitting'),
+      dryRun: z.boolean().optional().describe('Split the plan and stop, without touching files'),
+      roles: z
+        .record(
+          z.string(),
+          z.object({
+            runner: z.enum(['codex', 'claude']).optional(),
+            provider: z.string().optional(),
+            model: z.string().optional(),
+            effort: z.string().optional(),
+          }),
+        )
+        .optional()
+        .describe('Partially override roles for this job only, e.g. {"coder":{"model":"z-ai/glm-5.2"}}'),
+    },
+  },
+  async ({ plan, cwd, maxRounds, only, dryRun, roles }) => {
+    if (!cached) return text(`Config not usable.\n${configError}`);
+
+    // Ghi đè một phần cho job này; config trên đĩa không bị đụng tới.
+    let effective = cached;
+    if (roles) {
+      effective = {
+        ...cached,
+        roles: {
+          splitter: { ...cached.roles.splitter, ...(roles.splitter ?? {}) },
+          reviewer: { ...cached.roles.reviewer, ...(roles.reviewer ?? {}) },
+          coder: { ...cached.roles.coder, ...(roles.coder ?? {}) },
+        },
+      };
+      if (effective.roles.coder.runner !== 'codex') {
+        return text('roles.coder.runner must stay "codex" — the git guard only applies to the codex runner');
+      }
+    }
+
+    let job;
+    try {
+      job = createJob(plan, cwd);
+    } catch (e) {
+      return text((e as Error).message);
+    }
+    // Chạy nền; host poll bằng pipeline_status.
+    void runPipeline(job, effective, { maxRounds, only, dryRun });
+    return text(JSON.stringify({ job_id: job.id, state: job.state, cwd }));
+  },
+);
+
+server.registerTool(
+  'pipeline_status',
+  {
+    description: 'Poll the progress of a running pipeline job.',
+    inputSchema: {
+      job_id: z.string().min(1),
+      tail: z.number().int().positive().optional().describe('How many recent log lines to include'),
+    },
+  },
+  async ({ job_id, tail }) => {
+    const job = getJob(job_id);
+    if (!job) return text(`No such job: ${job_id}`);
+    return text(
+      JSON.stringify(
+        {
+          state: job.state,
+          current: job.current,
+          error: job.error,
+          tasks: job.tasks.map((t) => ({
+            id: t.item.id, title: t.item.title, state: t.state, round: t.round,
+          })),
+          log_tail: tail ? readTail(job, tail) : undefined,
+        },
+        null,
+        2,
+      ),
+    );
+  },
+);
+
+server.registerTool(
+  'pipeline_result',
+  {
+    description: 'Fetch the full result of a finished pipeline job, including per-task review notes.',
+    inputSchema: { job_id: z.string().min(1) },
+  },
+  async ({ job_id }) => {
+    const job = getJob(job_id);
+    if (!job) return text(`No such job: ${job_id}`);
+    return text(
+      JSON.stringify(
+        {
+          state: job.state,
+          error: job.error,
+          logDir: job.dir,
+          tasks: job.tasks.map((t) => ({
+            id: t.item.id, title: t.item.title, state: t.state, rounds: t.round,
+            files: t.item.files, review: t.lastReview ?? null,
+          })),
+          note: 'Nothing was committed or pushed. Review the diff and decide yourself.',
+        },
+        null,
+        2,
+      ),
+    );
+  },
+);
+
+server.registerTool(
+  'pipeline_cancel',
+  {
+    description:
+      'Cancel a running job. Child processes are killed; files already modified are left as they are.',
+    inputSchema: { job_id: z.string().min(1) },
+  },
+  async ({ job_id }) => text(cancelJob(job_id) ? `Cancelled ${job_id}` : `No such job: ${job_id}`),
+);
+
+await server.connect(new StdioServerTransport());
