@@ -6,7 +6,21 @@ import { loadConfig, DEFAULT_CONFIG_PATH, type Config } from './config.ts';
 import { createJob, getJob, cancelJob, readTail } from './jobs.ts';
 import { runPipeline } from './pipeline.ts';
 
-const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
+// `isError` chỉ gắn cho reply THẤT BẠI (job không tồn tại, config hỏng, cwd sai, khoá đang giữ...):
+// không có nó, host coi mọi lỗi là kết quả thành công và không có tín hiệu nào để xử lý khác đi.
+const text = (s: string, isError = false) => ({
+  content: [{ type: 'text' as const, text: s }],
+  ...(isError ? { isError: true } : {}),
+});
+
+// Ghi đè theo job. `.strict()` để gõ nhầm `modle` bị từ chối thay vì bị bỏ rơi im lặng và job
+// chạy với model của config mà người gọi tưởng đã đổi.
+const RoleOverride = z.object({
+  runner: z.enum(['codex', 'claude']).optional(),
+  provider: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  effort: z.string().optional(),
+}).strict();
 
 /** Job đã khởi động trong tiến trình này — dùng để huỷ sạch khi server bị tắt. */
 const started = new Set<string>();
@@ -30,7 +44,7 @@ server.registerTool(
     inputSchema: z.object({}).strict(),
   },
   async () => {
-    if (!cached) return text(`Config not usable.\n${configError}`);
+    if (!cached) return text(`Config not usable.\n${configError}`, true);
     const rows = Object.entries(cached.roles).map(([role, rc]) => {
       const bin = rc.runner === 'codex' ? cached!.binaries.codex : cached!.binaries.claude;
       return `${role}: runner=${rc.runner} model=${rc.model}` +
@@ -61,22 +75,22 @@ server.registerTool(
       maxRounds: z.number().int().positive().optional().describe('Override code→review rounds'),
       only: z.array(z.string()).optional().describe('Run only these task ids after splitting'),
       dryRun: z.boolean().optional().describe('Split the plan and stop, without touching files'),
+      // Đúng ba khoá vai trò, không phải record tuỳ ý: `{"codr":{...}}` từng lọt qua `.strict()`
+      // ở ngoài rồi bị bỏ rơi im lặng. (Không dùng z.record(z.enum(...)): ở Zod 4 nó BẮT BUỘC đủ
+      // cả ba khoá, tức là không cho ghi đè một phần.)
       roles: z
-        .record(
-          z.string(),
-          z.object({
-            runner: z.enum(['codex', 'claude']).optional(),
-            provider: z.string().optional(),
-            model: z.string().optional(),
-            effort: z.string().optional(),
-          }),
-        )
+        .object({
+          splitter: RoleOverride.optional(),
+          reviewer: RoleOverride.optional(),
+          coder: RoleOverride.optional(),
+        })
+        .strict()
         .optional()
         .describe('Partially override roles for this job only, e.g. {"coder":{"model":"z-ai/glm-5.2"}}'),
     }).strict(),
   },
   async ({ plan, cwd, maxRounds, only, dryRun, roles }) => {
-    if (!cached) return text(`Config not usable.\n${configError}`);
+    if (!cached) return text(`Config not usable.\n${configError}`, true);
 
     // Ghi đè một phần cho job này; config trên đĩa không bị đụng tới.
     let effective = cached;
@@ -89,8 +103,23 @@ server.registerTool(
           coder: { ...cached.roles.coder, ...(roles.coder ?? {}) },
         },
       };
+      // Chạy lại ĐÚNG các kiểm tra loadConfig áp cho config trên đĩa — ghi đè theo job không được
+      // đi vòng qua chúng. Nếu không, lỗi chỉ lộ ra muộn: provider gõ nhầm thành TypeError thô
+      // "reading 'baseUrl'" qua pipeline_status, sau khi thư mục job đã tạo và splitter đã tốn
+      // một lượt; runner claude mà thiếu binaries.claude thì thành spawn(undefined, ...).
       if (effective.roles.coder.runner !== 'codex') {
-        return text('roles.coder.runner must stay "codex" — the git guard only applies to the codex runner');
+        return text(
+          'roles.coder.runner must stay "codex" — the git guard only applies to the codex runner',
+          true,
+        );
+      }
+      for (const [role, rc] of Object.entries(effective.roles)) {
+        if (rc.runner === 'claude' && !effective.binaries.claude) {
+          return text(`roles.${role}.runner is "claude" but binaries.claude is not configured`, true);
+        }
+        if (rc.provider && rc.provider !== 'openai' && !effective.providers[rc.provider]) {
+          return text(`roles.${role}.provider "${rc.provider}" is not declared in providers`, true);
+        }
       }
     }
 
@@ -98,13 +127,13 @@ server.registerTool(
     // job rồi mới hỏng, và báo lỗi "not a git work tree ... run git init" — lời khuyên
     // sai cho một đường dẫn không tồn tại.
     const st = statSync(cwd, { throwIfNoEntry: false });
-    if (!st?.isDirectory()) return text(`cwd is not an existing directory: ${cwd}`);
+    if (!st?.isDirectory()) return text(`cwd is not an existing directory: ${cwd}`, true);
 
     let job;
     try {
       job = createJob(plan, cwd);
     } catch (e) {
-      return text((e as Error).message);
+      return text((e as Error).message, true);
     }
     started.add(job.id);
     // Chạy nền; host poll bằng pipeline_status.
@@ -126,7 +155,7 @@ server.registerTool(
   },
   async ({ job_id, tail }) => {
     const job = getJob(job_id);
-    if (!job) return text(`No such job: ${job_id}`);
+    if (!job) return text(`No such job: ${job_id}`, true);
     return text(
       JSON.stringify(
         {
@@ -153,7 +182,7 @@ server.registerTool(
   },
   async ({ job_id }) => {
     const job = getJob(job_id);
-    if (!job) return text(`No such job: ${job_id}`);
+    if (!job) return text(`No such job: ${job_id}`, true);
     return text(
       JSON.stringify(
         {
@@ -182,7 +211,7 @@ server.registerTool(
   },
   async ({ job_id }) => {
     const job = getJob(job_id);
-    if (!job) return text(`No such job: ${job_id}`);
+    if (!job) return text(`No such job: ${job_id}`, true);
     // cancelJob trả false cho job đã kết thúc. Báo "No such job" ở đây là nói sai với
     // người dùng về việc có gì bị dừng hay không.
     if (!cancelJob(job_id)) {

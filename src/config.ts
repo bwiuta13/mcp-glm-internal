@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import * as z from 'zod';
@@ -12,15 +12,23 @@ export const ROLE_SANDBOX = {
   coder: 'workspace-write',
 } as const satisfies Record<Role, string>;
 
+// `.strict()` ở MỌI cấp: đây là file người dùng tự gõ tay, nên "maxRound" thay vì "maxRounds"
+// phải bị từ chối chứ không được nuốt im lặng rồi chạy với mặc định. Cùng lý do với
+// `.strict()` trên schema của các tool MCP.
+// `provider` có `.min(1)`: chuỗi rỗng là falsy nên lọt qua `rc.provider && ...` bên dưới và
+// bỏ qua luôn bước kiểm provider đã khai báo.
 const RoleCfg = z.object({
   runner: z.enum(['codex', 'claude']),
-  provider: z.string().optional(),
+  provider: z.string().min(1).optional(),
   model: z.string().min(1),
   effort: z.string().optional(),
-});
+}).strict();
 
+// `.max(86400)` ở timeouts: setTimeout của Node kẹp mọi hạn vượt 2^31-1 ms (~2.147.483 giây)
+// xuống 1ms, nên một con số khổng lồ khiến MỌI lượt chạy hết giờ ngay lập tức. 86400 (một
+// ngày) là trần hợp lý, nằm xa dưới ngưỡng đó.
 const ConfigSchema = z.object({
-  binaries: z.object({ codex: z.string(), claude: z.string().optional() }),
+  binaries: z.object({ codex: z.string(), claude: z.string().optional() }).strict(),
   providers: z
     .record(
       z.string(),
@@ -28,20 +36,21 @@ const ConfigSchema = z.object({
         baseUrl: z.string().min(1),
         apiKeyEnv: z.string().min(1),
         wireApi: z.literal('responses').default('responses'),
-      }),
+      }).strict(),
     )
     .default({}),
-  roles: z.object({ splitter: RoleCfg, reviewer: RoleCfg, coder: RoleCfg }),
+  roles: z.object({ splitter: RoleCfg, reviewer: RoleCfg, coder: RoleCfg }).strict(),
   maxRounds: z.number().int().positive().default(3),
   timeouts: z
     .object({
-      splitter: z.number().int().positive().default(300),
-      reviewer: z.number().int().positive().default(300),
-      coder: z.number().int().positive().default(900),
+      splitter: z.number().int().positive().max(86400).default(300),
+      reviewer: z.number().int().positive().max(86400).default(300),
+      coder: z.number().int().positive().max(86400).default(900),
     })
+    .strict()
     .default({ splitter: 300, reviewer: 300, coder: 900 }),
   snapshotUntracked: z.boolean().default(false),
-});
+}).strict();
 
 export type Config = z.infer<typeof ConfigSchema>;
 
@@ -71,6 +80,15 @@ export function loadConfig(path: string = DEFAULT_CONFIG_PATH): Config {
     if (p === undefined) continue;
     if (!p.startsWith('/')) throw new Error(`binaries.${name} must be an absolute path, got: ${p}`);
     if (!existsSync(p)) throw new Error(`binaries.${name} not found on disk: ${p}`);
+    // existsSync nhận cả thư mục, nên một đường dẫn trỏ nhầm vào thư mục từng được `capabilities`
+    // in "OK" và lỗi thật chỉ lộ ra sau ba lượt "did not return valid JSON". Phải là FILE và có
+    // quyền thực thi.
+    if (!statSync(p).isFile()) throw new Error(`binaries.${name} is not a file: ${p}`);
+    try {
+      accessSync(p, constants.X_OK);
+    } catch {
+      throw new Error(`binaries.${name} is not executable: ${p}`);
+    }
   }
 
   // Lá chắn git (execpolicy) chỉ áp được cho runner codex.

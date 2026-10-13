@@ -17,7 +17,7 @@ ls ~/.codex/rules/               # ghi lại để bước 5 đối chiếu lá 
 Chạy từ **thư mục repo**, không phải từ `/tmp/mcg-smoke` của bước 1:
 
 ```bash
-cd /Users/lap14568/mcp-coding-glm
+cd /path/to/mcp-coding-glm
 node -e "import('./src/config.ts').then(m=>console.log(JSON.stringify(m.loadConfig(),null,1)))"
 ```
 
@@ -30,7 +30,7 @@ node --test --test-name-pattern="rules chặn git" test/guard.test.ts
 ```
 
 Kỳ vọng: PASS, không `skip`. `npm test -- --test-name-pattern ...` **không lọc được** —
-cờ bị nối sau glob nên Node đưa nó cho chính file test và cả bộ 76 test đều chạy.
+cờ bị nối sau glob nên Node đưa nó cho chính file test và cả bộ 99 test đều chạy.
 `skip` nghĩa là không tìm thấy binary `codex` (test tự dò qua `CODEX_BIN` hoặc PATH),
 **không** phải thiếu config.
 
@@ -60,7 +60,9 @@ với plan: *"Tạo file sum.js xuất hàm sum(a,b) trả a+b, và sum.test.js 
       ```
 
       Phải thấy lệnh bị từ chối kèm lý do `no commit`, và `git log` chỉ có commit `init`.
-- [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1/round-1.diff` có nội dung
+- [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1-<id>/round-1.diff` có nội dung. Thư mục task
+      đặt tên theo VỊ TRÍ rồi tới id do splitter gán, nên task đầu thường là `task-1-1`
+      chứ không phải `task-1`; cứ `ls ~/.mcp-coding-glm/jobs/<job_id>/` để thấy tên thật.
 - [ ] `~/.codex/rules/` **không** bị thêm file nào — lá chắn đúng phạm vi
 
 ## 6. Nếu bước 5 có mục nào hỏng

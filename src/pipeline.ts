@@ -64,14 +64,21 @@ ${JSON_ONLY}`;
  * Dùng GIT_INDEX_FILE tạm: `git add -A` ghi vào index TẠM đó rồi `write-tree` biến nó
  * thành tree. Index, status và ref thật không bị đụng; chỉ sinh object không ai tham
  * chiếu, `git gc` sẽ dọn. Trả null khi cwd không phải git work tree.
+ *
+ * Mọi execFileSync trong file này chạy TRÊN event loop và có `timeout: 60_000`. Không có hạn
+ * thì `git add -A` trên repo lớn (hay một git bị kẹt) làm server không trả lời nổi
+ * `pipeline_status` lẫn `pipeline_cancel` — trông như treo đúng lúc người dùng đưa tay tìm nút
+ * dừng. Hết hạn thì execFileSync ném, và nhánh catch bên dưới trả null.
  */
 function snapshotTree(cwd: string): string | null {
   const idx = join(tmpdir(), `mcg-idx-${randomUUID()}`);
   const env = { ...process.env, GIT_INDEX_FILE: idx };
   try {
-    execFileSync('git', ['add', '-A'], { cwd, env, stdio: ['ignore', 'ignore', 'ignore'] });
+    execFileSync('git', ['add', '-A'], {
+      cwd, env, stdio: ['ignore', 'ignore', 'ignore'], timeout: 60_000,
+    });
     return execFileSync('git', ['write-tree'], {
-      cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000,
     }).trim();
   } catch {
     return null; // không phải repo git, hoặc git không chạy được
@@ -92,7 +99,11 @@ export async function runPipeline(
   try {
     // PHẢI nằm trong try: ném ra ngoài đây thì job kẹt ở 'queued', khoá không bao giờ
     // được nhả, và `void runPipeline(...)` ở index.ts làm sập cả tiến trình MCP.
-    const guardHome = ensureGuardHome();
+    // Gốc dữ liệu suy ra từ job.dir (= <gốc>/jobs/<id>, xem createJob) thay vì mặc định ở
+    // $HOME: job của test nằm trong cây tạm của nó thì guard home cũng phải ở đó, nếu không
+    // mỗi lần chạy test lại ghi vào ~/.mcp-coding-glm thật. Ở production gốc vẫn là
+    // ~/.mcp-coding-glm nên đường dẫn không đổi.
+    const guardHome = ensureGuardHome(dirname(dirname(job.dir)));
 
     // Không phải repo git thì KHÔNG có lưới an toàn nào. Báo to ngay, đừng để người dùng
     // phát hiện lúc cần lùi lại.
@@ -106,8 +117,20 @@ export async function runPipeline(
     }
     // ---------- SPLIT ----------
     job.state = 'splitting';
-    let splitPrompt = SPLIT_PROMPT(job.plan);
+    // Plan đi thẳng vào argv của splitter. Vượt ~1MiB (giới hạn macOS) thì spawn ném E2BIG:
+    // exitCode -1, tin nhắn rỗng, ba lượt phí, rồi người dùng bị báo "did not return valid JSON"
+    // — sai nguyên nhân. Cắt như đã làm với diff của reviewer, nhưng có ghi sự kiện: mất đuôi
+    // plan là mất việc, người dùng phải biết được.
+    const PLAN_CAP = 200_000;
+    let plan = job.plan;
+    if (plan.length > PLAN_CAP) {
+      plan = `${plan.slice(0, PLAN_CAP)}\n\n[... plan truncated: ` +
+        `${job.plan.length - PLAN_CAP} more characters were omitted because it exceeded the size limit ...]`;
+      appendEvent(job, { type: 'plan.truncated', original: job.plan.length, kept: PLAN_CAP });
+    }
+    let splitPrompt = SPLIT_PROMPT(plan);
     let tasks = null as null | ReturnType<typeof TaskListSchema.parse>;
+    let splitTimedOut = false;
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       appendEvent(job, { type: 'split.attempt', attempt });
@@ -120,18 +143,28 @@ export async function runPipeline(
       // coroutine này đi tiếp và spawn con workspace-write MỚI sau khi người dùng đã
       // thấy "Cancelled" — và một job khác có thể đang giữ khoá thư mục đó rồi.
       if (job.state === 'cancelled') return;
+      // Hết giờ thì dừng luôn, như coder: thử lại chỉ đốt thêm một hạn nữa (3 × timeouts.splitter)
+      // rồi báo "did not return valid JSON" — chẩn đoán sai, vì vấn đề là agent không trả lời.
+      if (r.timedOut) {
+        splitTimedOut = true;
+        writeFileSync(join(job.dir, `split-${attempt}.stderr`), r.stderr);
+        appendEvent(job, { type: 'split.timeout', attempt, seconds: cfg.timeouts.splitter });
+        break;
+      }
       const parsed = parseContract(r.lastMessage, TaskListSchema);
       if (parsed.ok) { tasks = parsed.value; break; }
       writeFileSync(join(job.dir, `split-${attempt}.stderr`), r.stderr);
       appendEvent(job, {
         type: 'split.invalid', attempt, code: r.exitCode, reason: parsed.repairPrompt,
       });
-      splitPrompt = `${SPLIT_PROMPT(job.plan)}\n\n${parsed.repairPrompt}`;
+      splitPrompt = `${SPLIT_PROMPT(plan)}\n\n${parsed.repairPrompt}`;
     }
 
     if (!tasks) {
       job.state = 'failed';
-      job.error = 'split failed: splitter did not return valid JSON after 3 attempts';
+      job.error = splitTimedOut
+        ? `split failed: splitter timed out after ${cfg.timeouts.splitter}s`
+        : 'split failed: splitter did not return valid JSON after 3 attempts';
       appendEvent(job, { type: 'job.failed', error: job.error });
       return;
     }
@@ -177,7 +210,7 @@ export async function runPipeline(
           // -z: không có nó, git bọc tên có dấu hoặc dấu nháy trong "..." và ta bỏ sót
           // im lặng — đã đo: 'chưa-theo-dõi.txt' bị bỏ qua mà vẫn báo đã chép.
           untracked = execFileSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
-            cwd: job.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+            cwd: job.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000,
           }).split('\0').filter(Boolean);
         } catch {
           // không phải repo git — không có gì để liệt kê
@@ -217,7 +250,15 @@ export async function runPipeline(
         // chính là lúc cần bản vá để lùi lại nhất.
         const treeAfter = snapshotTree(job.cwd);
         let diff = '';
-        if (treeBefore && treeAfter) {
+        if (!treeBefore || !treeAfter) {
+          // Không chụp được thì diff rỗng KHÔNG có nghĩa là coder không làm gì, nhưng round-N.diff
+          // vẫn ra rỗng và reviewer vẫn bị bảo "(no changes were made)" — nên task có thể đậu trên
+          // đúng cơ sở đó. Ít nhất phải để lại dấu vết để người đọc log phân biệt được.
+          appendEvent(job, {
+            type: 'snapshot.failed', id: t.item.id, round,
+            before: treeBefore !== null, after: treeAfter !== null,
+          });
+        } else {
           try {
             // So hai tree -> delta ĐÚNG CỦA TASK NÀY, không lẫn việc của task trước và
             // không lẫn thay đổi người dùng đã có sẵn. --binary để bản vá dùng lại được.
@@ -226,7 +267,7 @@ export async function runPipeline(
               treeBefore, treeAfter,
             ], {
               cwd: job.cwd, encoding: 'utf8',
-              maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+              maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000,
             });
           } catch (e) {
             appendEvent(job, {
@@ -238,7 +279,7 @@ export async function runPipeline(
 
         if (coded.timedOut) {
           t.state = 'timeout';
-          appendEvent(job, { type: 'task.timeout', id: t.item.id, round });
+          appendEvent(job, { type: 'task.timeout', id: t.item.id, round, role: 'coder' });
           break;
         }
 
@@ -253,6 +294,7 @@ export async function runPipeline(
           : diff;
         let reviewPrompt = REVIEW_PROMPT(t.item, shown);
         let review: Review | null = null;
+        let reviewTimedOut = false;
 
         for (let attempt = 1; attempt <= 3; attempt++) {
           const r = await runRole('reviewer', cfg, {
@@ -261,10 +303,19 @@ export async function runPipeline(
             onSpawn: (c) => { job.children.add(c); c.on('close', () => job.children.delete(c)); },
           });
           if (job.state === 'cancelled') return;
+          // Reviewer treo thì thử lại chỉ đốt thêm hạn (3 × timeouts.reviewer mỗi vòng) rồi báo
+          // review_unparseable — chẩn đoán sai. Dừng ngay và gọi đúng tên là timeout.
+          if (r.timedOut) { reviewTimedOut = true; break; }
           const parsed = parseContract(r.lastMessage, ReviewSchema);
           if (parsed.ok) { review = parsed.value; break; }
           appendEvent(job, { type: 'review.invalid', id: t.item.id, round, attempt });
           reviewPrompt = `${REVIEW_PROMPT(t.item, shown)}\n\n${parsed.repairPrompt}`;
+        }
+
+        if (reviewTimedOut) {
+          t.state = 'timeout';
+          appendEvent(job, { type: 'task.timeout', id: t.item.id, round, role: 'reviewer' });
+          break;
         }
 
         if (!review) {
@@ -309,6 +360,16 @@ export async function runPipeline(
     appendEvent(job, { type: 'job.failed', error: job.error });
   } finally {
     job.children.clear();
+    // Huỷ giữa chừng: cancelJob đã giết con và đổi job sang 'cancelled', nhưng task đang dở vẫn
+    // mang 'coding'/'reviewing' và job.current vẫn trỏ vào nó. `$task-stop` nói agent đã bị
+    // giết, rồi `$task-status` lại báo một task đang code. Dọn ở đây vì MỌI đường thoát do huỷ
+    // (ba điểm `return` sau await lẫn nhánh catch) đều đi qua finally.
+    if (job.state === 'cancelled') {
+      job.current = null;
+      for (const task of job.tasks) {
+        if (task.state === 'coding' || task.state === 'reviewing') task.state = 'pending';
+      }
+    }
     releaseJob(job);
   }
 }

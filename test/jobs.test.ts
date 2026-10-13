@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { createJob, getJob, appendEvent, readTail, releaseJob, cancelJob } from '../src/jobs.ts';
 
 const root = () => mkdtempSync(join(tmpdir(), 'mcg-jobs-'));
@@ -134,4 +134,26 @@ test('sự kiện luôn có dấu thời gian kiểu số', () => {
   assert.equal(typeof last.t, 'number');
   assert.ok(last.t > 0);
   releaseJob(j);
+});
+
+test('đường dẫn dài toàn chữ có dấu vẫn tạo được khoá — tên file khoá không vượt NAME_MAX', () => {
+  const r = root();
+  // 115 ký tự tiếng Việt: encodeURIComponent biến mỗi byte UTF-8 thành "%XX" nên tên file khoá
+  // dài hơn 1000 ký tự và createJob từng ném ENAMETOOLONG. Thư mục không cần tồn tại.
+  const cwd = '/tmp/' + 'ế'.repeat(115);
+  const j = createJob('p', cwd, r);
+  assert.ok(Buffer.byteLength(basename(j.lockFile)) < 255, `tên khoá dài ${basename(j.lockFile).length}`);
+  assert.ok(existsSync(j.lockFile));
+  assert.throws(() => createJob('p', cwd, r), new RegExp(j.id), 'khoá vẫn phải chặn job thứ hai');
+  releaseJob(j);
+  assert.ok(!existsSync(j.lockFile), 'nhả khoá phải xoá đúng file đó');
+});
+
+test('hai thư mục khác nhau không dùng chung file khoá, dù cùng tiền tố dài', () => {
+  const r = root();
+  const a = createJob('p', '/tmp/' + 'a'.repeat(100) + '-1', r);
+  const b = createJob('p', '/tmp/' + 'a'.repeat(100) + '-2', r); // không ném: không đụng khoá của a
+  assert.notEqual(a.lockFile, b.lockFile);
+  releaseJob(a);
+  releaseJob(b);
 });

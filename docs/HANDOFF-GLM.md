@@ -1,3 +1,5 @@
+> **Historical hand-off document (tài liệu bàn giao lịch sử)** — its status lines (test counts, branch name, the "Còn lại" task list) are no longer current; see `README.md` and `git log` for the real state.
+
 # Bàn giao cho GLM — mcp-coding-glm
 
 Repo: `/Users/lap14568/mcp-coding-glm` · nhánh `feat/mcp-coding-glm`

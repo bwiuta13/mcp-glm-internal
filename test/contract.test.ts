@@ -194,3 +194,53 @@ test('issue thiếu hẳn file và line thì vẫn chấp nhận', () => {
   const r = parseContract(raw, ReviewSchema);
   assert.equal(r.ok, true);
 });
+
+// --- Mỗi lượt chạy là một `codex exec` mới, không có lịch sử: câu sửa phải tự mang nội dung cần sửa ---
+
+test('câu sửa mang theo chính câu trả lời bị từ chối, cho cả hai loại lỗi', () => {
+  const notJson = parseContract('MARKER-A xin loi toi khong biet', TaskListSchema);
+  assert.equal(notJson.ok, false);
+  if (!notJson.ok) assert.match(notJson.repairPrompt, /<rejected_reply>\nMARKER-A xin loi toi khong biet\n<\/rejected_reply>/);
+
+  const wrongShape = parseContract(
+    JSON.stringify({ tasks: [{ id: '1', title: 'MARKER-B', detail: 'd', acceptance: 'ok' }] }),
+    TaskListSchema,
+  );
+  assert.equal(wrongShape.ok, false);
+  if (!wrongShape.ok) {
+    assert.match(wrongShape.repairPrompt, /tasks\.0\.files/, 'vẫn phải gọi tên vấn đề');
+    assert.match(wrongShape.repairPrompt, /<rejected_reply>\n.*MARKER-B.*\n<\/rejected_reply>/, 'và kèm câu bị từ chối');
+  }
+});
+
+test('câu trả lời bị từ chối được cắt ở 4000 ký tự và có ghi chú cắt bớt', () => {
+  const r = parseContract('x'.repeat(10_000) + 'TAIL-MARKER', TaskListSchema);
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.ok(r.repairPrompt.length < 5_000, `câu sửa dài ${r.repairPrompt.length} — chưa cắt`);
+    assert.ok(!r.repairPrompt.includes('TAIL-MARKER'), 'đuôi của câu trả lời phải bị cắt');
+    assert.match(r.repairPrompt, /\[\.\.\. truncated 6011 more characters\]/);
+  }
+});
+
+test('câu trả lời rỗng được ghi rõ là rỗng thay vì để một khối trống', () => {
+  const r = parseContract('', TaskListSchema);
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.repairPrompt, /<rejected_reply>\n\(empty\)\n<\/rejected_reply>/);
+});
+
+test('line dạng chuỗi số được ép về số, null vẫn là null chứ không thành 0', () => {
+  const raw = JSON.stringify({
+    verdict: 'fail',
+    issues: [
+      { severity: 'minor', file: 'a.ts', line: '3', message: 'x' },
+      { severity: 'minor', file: null, line: null, message: 'y' },
+    ],
+  });
+  const r = parseContract(raw, ReviewSchema);
+  assert.equal(r.ok, true);
+  if (r.ok) {
+    assert.strictEqual(r.value.issues[0].line, 3);
+    assert.strictEqual(r.value.issues[1].line, null);
+  }
+});

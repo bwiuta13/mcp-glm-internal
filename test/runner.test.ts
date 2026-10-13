@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
+import {
+  mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, readdirSync, statSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { runRole, ensureGuardHome, GUARD_RULES } from '../src/runner.ts';
+import { runRole, ensureGuardHome, GUARD_RULES, type RunResult } from '../src/runner.ts';
 
 const FAKE = resolve(import.meta.dirname, 'fixtures/fake-codex.sh');
 
@@ -34,47 +36,71 @@ test('ensureGuardHome ghi đúng nội dung rules', () => {
   assert.match(body, /^prefix_rule\(pattern=\["git","push"\], decision="forbidden"/m);
 });
 
+test('ensureGuardHome thay file rules bằng rename chứ không cắt cụt tại chỗ', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mcg-g-'));
+  const home = ensureGuardHome(root);
+  const rules = join(home, 'rules', 'guard.rules');
+  const inoBefore = statSync(rules).ino;
+  ensureGuardHome(root);
+  // Ghi đè tại chỗ giữ nguyên inode — và có một khoảnh khắc file rỗng cho codex con đang đọc
+  // thấy, tức lớp lá chắn execpolicy biến mất không dấu vết. Rename thì cho ra inode mới.
+  assert.notEqual(statSync(rules).ino, inoBefore, 'file bị ghi đè tại chỗ, không phải thay bằng rename');
+  assert.equal(readFileSync(rules, 'utf8'), GUARD_RULES);
+  // Không để rác: tệp tạm đã được đổi tên đi, và không bao giờ nằm trong rules/ (nơi codex quét).
+  assert.deepEqual(readdirSync(join(home, 'rules')), ['guard.rules']);
+  assert.deepEqual(readdirSync(home).filter((f) => f.endsWith('.tmp')), []);
+});
+
 test('runRole đọc được lastMessage từ file -o', async () => {
   chmodSync(FAKE, 0o755);
   const { cfg, dir } = cfgWith();
   const out = join(dir, 'last.txt');
   process.env.FAKE_LAST_MESSAGE = '{"tasks":[]}';
-  const r = await runRole('splitter', cfg, {
-    prompt: 'xin chao', cwd: dir, guardHome: ensureGuardHome(dir), outFile: out,
-  });
-  delete process.env.FAKE_LAST_MESSAGE;
-  assert.equal(r.exitCode, 0);
-  assert.equal(r.timedOut, false);
-  assert.equal(r.lastMessage, '{"tasks":[]}');
+  try {
+    const r = await runRole('splitter', cfg, {
+      prompt: 'xin chao', cwd: dir, guardHome: ensureGuardHome(dir), outFile: out,
+    });
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.timedOut, false);
+    assert.equal(r.lastMessage, '{"tasks":[]}');
+  } finally {
+    delete process.env.FAKE_LAST_MESSAGE;
+  }
 });
 
 test('exit khác 0 được báo lại trung thực', async () => {
   chmodSync(FAKE, 0o755);
   const { cfg, dir } = cfgWith();
   process.env.FAKE_EXIT = '3';
-  const r = await runRole('coder', cfg, {
-    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-  delete process.env.FAKE_EXIT;
-  assert.equal(r.exitCode, 3);
+  try {
+    const r = await runRole('coder', cfg, {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+    assert.equal(r.exitCode, 3);
+  } finally {
+    delete process.env.FAKE_EXIT;
+  }
 });
 
 test('quá giờ thì bị giết và đánh dấu timedOut', async () => {
   chmodSync(FAKE, 0o755);
   const { cfg, dir } = cfgWith({ timeouts: { splitter: 1, reviewer: 1, coder: 1 } });
   process.env.FAKE_SLEEP = '5';
-  const started = Date.now();
-  const r = await runRole('coder', cfg, {
-    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-  const elapsed = Date.now() - started;
-  delete process.env.FAKE_SLEEP;
-  assert.equal(r.timedOut, true);
-  // Cuộc đua cũ (SIGKILL hạ `sleep` trước, `sh` kịp chạy `exit 0`) đã biến mất nhờ
-  // `exec sleep` trong fixture: giờ con trực tiếp CHÍNH LÀ sleep, không còn shell để
-  // thức dậy. Đo lại: 0/100 lần đỏ. Giữ assertion này vì nó ghim họ mutant `code ?? 0`.
-  assert.equal(r.exitCode, -1, 'phải bị giết, không được tự thoát 0');
-  assert.ok(elapsed < 3000, `hạn 1s mà settle mất ${elapsed}ms`);
+  try {
+    const started = Date.now();
+    const r = await runRole('coder', cfg, {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(r.timedOut, true);
+    // Cuộc đua cũ (SIGKILL hạ `sleep` trước, `sh` kịp chạy `exit 0`) đã biến mất nhờ
+    // `exec sleep` trong fixture: giờ con trực tiếp CHÍNH LÀ sleep, không còn shell để
+    // thức dậy. Đo lại: 0/100 lần đỏ. Giữ assertion này vì nó ghim họ mutant `code ?? 0`.
+    assert.equal(r.exitCode, -1, 'phải bị giết, không được tự thoát 0');
+    assert.ok(elapsed < 3000, `hạn 1s mà settle mất ${elapsed}ms`);
+  } finally {
+    delete process.env.FAKE_SLEEP;
+  }
 });
 
 // --- Ghim argv và env an toàn: đây là chỗ mutation testing cho thấy hổng nhất ---
@@ -94,10 +120,13 @@ async function argvOf(role: 'splitter' | 'reviewer' | 'coder', provider: string 
   }));
   const rec = join(dir, 'rec.txt');
   process.env.RECORD_TO = rec;
-  await runRole(role, loadConfig(p), {
-    prompt: 'xin chao', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-  delete process.env.RECORD_TO;
+  try {
+    await runRole(role, loadConfig(p), {
+      prompt: 'xin chao', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+  } finally {
+    delete process.env.RECORD_TO;
+  }
   const body = readFileSync(rec, 'utf8');
   const argv = body.split('ARGV_BEGIN\n')[1].split('\nARGV_END')[0].split('\n');
   return { argv, body };
@@ -134,7 +163,12 @@ test('CODEX_HOME trỏ guard home, PATH được nối thêm chứ không thay t
   assert.ok(!/CODEX_HOME=[^\n]*\/\.codex$/.test(body), 'không được trỏ vào ~/.codex của người dùng');
   const path = body.split('PATH=')[1].split('\n')[0];
   assert.ok(path.startsWith(process.env.PATH ?? ''), 'PATH cha phải còn nguyên ở đầu');
-  assert.ok(path.includes('/usr/bin'), 'phải nối thêm thư mục chuẩn');
+  // KHÔNG dùng includes('/usr/bin'): PATH cha thường đã có sẵn /usr/bin nên phép đó xanh kể cả
+  // khi runner chẳng nối thêm gì. Phải khẳng định chính cái đuôi được nối vào.
+  assert.ok(
+    path.endsWith(':/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin'),
+    `PATH con không kết thúc bằng các thư mục chuẩn được nối thêm: ${path}`,
+  );
 });
 
 test('runner claude đặt prompt ngay sau -p để --tools không nuốt mất', async () => {
@@ -151,10 +185,13 @@ test('runner claude đặt prompt ngay sau -p để --tools không nuốt mất'
   }));
   const rec = join(dir, 'rec.txt');
   process.env.RECORD_TO = rec;
-  await runRole('splitter', loadConfig(p), {
-    prompt: 'xin chao', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-  delete process.env.RECORD_TO;
+  try {
+    await runRole('splitter', loadConfig(p), {
+      prompt: 'xin chao', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+  } finally {
+    delete process.env.RECORD_TO;
+  }
   const argv = readFileSync(rec, 'utf8').split('ARGV_BEGIN\n')[1].split('\nARGV_END')[0].split('\n');
   assert.equal(argv[0], '-p');
   assert.equal(argv[1], 'xin chao', 'prompt phải đứng ngay sau -p');
@@ -181,31 +218,45 @@ test('outFile của lượt trước bị xoá, không bị đọc nhầm thành
   // bỏ rmSync — tức là chẳng ghim được gì.
   process.env.FAKE_NO_WRITE = '1';
   process.env.FAKE_EXIT = '1';
-  const r = await runRole('coder', cfg, {
-    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: out,
-  });
-  delete process.env.FAKE_NO_WRITE;
-  delete process.env.FAKE_EXIT;
-  assert.equal(r.lastMessage, '', 'phải rỗng, không được là kết quả lượt trước');
+  try {
+    const r = await runRole('coder', cfg, {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: out,
+    });
+    assert.equal(r.lastMessage, '', 'phải rỗng, không được là kết quả lượt trước');
+  } finally {
+    delete process.env.FAKE_NO_WRITE;
+    delete process.env.FAKE_EXIT;
+  }
 });
 
 test('văn bản tiếng Việt dài không bị hỏng ở ranh giới chunk', async () => {
   chmodSync(FAKE, 0o755);
   const { cfg, dir } = cfgWith();
   process.env.FAKE_BIG_UTF8 = '5000'; // ~305KB thật, vượt nhiều lần ngưỡng chunk 64KB
-  const r = await runRole('coder', cfg, {
-    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-  delete process.env.FAKE_BIG_UTF8;
-  assert.ok(r.stdout.length > 100000, `chỉ nhận được ${r.stdout.length} ký tự`);
-  assert.ok(!r.stdout.includes('�'), 'có ký tự hỏng — decode từng chunk rời');
-  assert.ok(!r.stderr.includes('�'), 'stderr cũng phải setEncoding');
-  assert.match(r.stdout, /ăâêôơưđ ÀÁẠẢÃ/);
+  try {
+    const r = await runRole('coder', cfg, {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+    assert.ok(r.stdout.length > 100000, `chỉ nhận được ${r.stdout.length} ký tự`);
+    assert.ok(!r.stdout.includes('�'), 'có ký tự hỏng — decode từng chunk rời');
+    assert.ok(!r.stderr.includes('�'), 'stderr cũng phải setEncoding');
+    assert.match(r.stdout, /ăâêôơưđ ÀÁẠẢÃ/);
+  } finally {
+    delete process.env.FAKE_BIG_UTF8;
+  }
 });
 
-// Hai test dưới đây ghim chính tính chất an toàn: agent có quyền ghi file không được
-// phép sống sót thành mồ côi sau khi hết giờ. Thiếu chúng, bỏ `detached` hay đổi
-// process.kill(-pid) về child.kill() sẽ không làm đỏ bất cứ thứ gì.
+// Hai test dưới đây KHÔNG cùng loại — đừng đọc chúng như một lời bảo đảm chung:
+//  - Test 1 ghim tính chất an toàn thật: cháu NẰM TRONG nhóm tiến trình bị giết cùng cha khi
+//    hết giờ. Thiếu nó, bỏ `detached` hay đổi process.kill(-pid) về child.kill() sẽ không
+//    làm đỏ bất cứ thứ gì.
+//  - Test 2 chỉ ghim việc runRole TRẢ VỀ đúng hạn dù có một cháu giữ pipe. Nó KHÔNG chứng minh
+//    cháu bị giết, và thực tế là không: cháu tự `setsid` thoát nhóm thì sống sót (`sleep 8` của
+//    fixture vẫn chạy sau khi test kết thúc), pipeline chỉ bỏ pipe phía mình chứ không đợi nó.
+//    Một tác vụ của coder mà đẻ tiến trình nền TỰ tách khỏi nhóm (dev server tự daemon hoá,
+//    `setsid ...`, test watcher tự tách) có thể để lại tiến trình đó — README mục Safety model
+//    nói thẳng điều này. (Chỉ `&` thì chưa đủ: job nền của một shell không tương tác vẫn nằm
+//    trong nhóm của nó nên vẫn bị giết.)
 
 test('quá giờ thì giết cả NHÓM — cháu trong nhóm không được sống sót', async () => {
   chmodSync(FAKE, 0o755);
@@ -216,20 +267,24 @@ test('quá giờ thì giết cả NHÓM — cháu trong nhóm không được s�
   const pidFile = join(dir, 'gc.pid');
   process.env.FAKE_GRANDCHILD_PIDFILE = pidFile;
   const started = Date.now();
-  const pending = runRole('coder', cfg, {
-    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-
-  // Đọc pid NGAY khi fixture ghi ra, song song với lượt chạy — đọc sau khi runRole kết
-  // thúc là đọc một file mà tiến trình đã bị giết có thể chưa kịp tạo.
   let pid = 0;
-  const readBy = Date.now() + 20_000;
-  while (Date.now() < readBy && pid <= 0) {
-    if (existsSync(pidFile)) pid = Number(readFileSync(pidFile, 'utf8').trim()) || 0;
-    if (pid <= 0) await new Promise((res) => setTimeout(res, 20));
+  let r: RunResult;
+  try {
+    const pending = runRole('coder', cfg, {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+
+    // Đọc pid NGAY khi fixture ghi ra, song song với lượt chạy — đọc sau khi runRole kết
+    // thúc là đọc một file mà tiến trình đã bị giết có thể chưa kịp tạo.
+    const readBy = Date.now() + 20_000;
+    while (Date.now() < readBy && pid <= 0) {
+      if (existsSync(pidFile)) pid = Number(readFileSync(pidFile, 'utf8').trim()) || 0;
+      if (pid <= 0) await new Promise((res) => setTimeout(res, 20));
+    }
+    r = await pending;
+  } finally {
+    delete process.env.FAKE_GRANDCHILD_PIDFILE;
   }
-  const r = await pending;
-  delete process.env.FAKE_GRANDCHILD_PIDFILE;
 
   assert.ok(pid > 0, 'fixture không ghi được pid của cháu');
   assert.equal(r.timedOut, true);
@@ -255,15 +310,18 @@ test('quá giờ thì giết cả NHÓM — cháu trong nhóm không được s�
   assert.ok(gone, `cháu pid ${pid} còn sống — group kill hỏng, agent ghi file thành mồ côi`);
 });
 
-test('cháu tự thoát nhóm mà giữ pipe thì vẫn không kéo dài quá hạn', async () => {
+test('cháu tự thoát nhóm mà giữ pipe thì vẫn không kéo dài quá hạn (cháu đó KHÔNG bị giết)', async () => {
   chmodSync(FAKE, 0o755);
   const { cfg, dir } = cfgWith({ timeouts: { splitter: 1, reviewer: 1, coder: 1 } });
   process.env.FAKE_ESCAPED_NODE = process.execPath;
-  const started = Date.now();
-  const r = await runRole('coder', cfg, {
-    prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
-  });
-  delete process.env.FAKE_ESCAPED_NODE;
-  assert.equal(r.timedOut, true);
-  assert.ok(Date.now() - started < 3000, 'huỷ pipe phía ta không hoạt động');
+  try {
+    const started = Date.now();
+    const r = await runRole('coder', cfg, {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+    assert.equal(r.timedOut, true);
+    assert.ok(Date.now() - started < 3000, 'huỷ pipe phía ta không hoạt động');
+  } finally {
+    delete process.env.FAKE_ESCAPED_NODE;
+  }
 });

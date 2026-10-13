@@ -1,6 +1,9 @@
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import {
+  existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ROLE_SANDBOX, type Config, type Role } from './config.ts';
@@ -29,7 +32,21 @@ export const GUARD_RULES =
 export function ensureGuardHome(root: string = join(homedir(), '.mcp-coding-glm')): string {
   const home = join(root, 'codex-home');
   mkdirSync(join(home, 'rules'), { recursive: true });
-  writeFileSync(join(home, 'rules', 'guard.rules'), GUARD_RULES);
+
+  // File này DÙNG CHUNG cho mọi job. `writeFileSync` cắt cụt về 0 byte rồi mới ghi, nên hai job
+  // ở hai thư mục khác nhau có thể để một codex con đọc đúng khoảnh khắc file rỗng — và lớp
+  // lá chắn execpolicy biến mất mà không báo gì. Ghi ra tệp tạm rồi `rename` đè lên: người đọc
+  // luôn thấy hoặc bản cũ hoặc bản mới, đầy đủ. Tệp tạm nằm NGOÀI `rules/` để codex, khi quét
+  // thư mục đó, không bao giờ gặp một file ghi dở.
+  const rules = join(home, 'rules', 'guard.rules');
+  const tmp = join(home, `.guard.rules.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmp, GUARD_RULES);
+    renameSync(tmp, rules);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
 
   // CODEX_HOME riêng cũng tách luôn phần xác thực: `codex exec --help` ghi rõ "auth still
   // uses CODEX_HOME". Đo thật với guard home sạch: 401 Unauthorized. Nối auth của người

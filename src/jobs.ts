@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { TaskItem, Review } from './contract.ts';
 
 export type JobState = 'queued' | 'splitting' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -57,7 +57,11 @@ export function createJob(
   // thấy Map của nhau. Hai agent sửa cùng một thư mục tại chỗ, không commit, là mất
   // việc không cứu lại được.
   const lockDir = join(root, 'locks');
-  const lockFile = join(lockDir, encodeURIComponent(key) + '.lock');
+  // Tên file là BĂM của khoá, không phải encodeURIComponent(key): "/" thành "%2F" (x3) và mỗi
+  // byte của chữ có dấu thành "%XX" (x3), nên một đường dẫn tiếng Việt 115 ký tự đã vượt
+  // NAME_MAX (255 byte) và createJob ném ENAMETOOLONG. Băm cho độ dài cố định, và vẫn xác định
+  // — hai tiến trình tính ra cùng tên cho cùng một thư mục, đó mới là điều khoá liên tiến trình cần.
+  const lockFile = join(lockDir, createHash('sha256').update(key).digest('hex').slice(0, 32) + '.lock');
   mkdirSync(lockDir, { recursive: true });
   if (existsSync(lockFile)) {
     try {

@@ -31,7 +31,11 @@ export const ReviewSchema = z.object({
         // LLM thường trả null cho field vắng mặt. Từ chối null ở đây tốn nguyên
         // một lượt reviewer chạy lại, nên nhận cả null lẫn undefined.
         file: z.string().nullish(),
-        line: z.number().int().nullish(),
+        // `line` chỉ để người đọc, không logic nào dùng tới: từ chối cả bản review vì
+        // "line":"3" (chuỗi số) là đốt một lượt reviewer cho một field thẩm mỹ — cùng lý do với
+        // null ở trên. Ép về số thay vì bắt chạy lại. `nullish()` đứng NGOÀI coerce nên null vẫn
+        // là null; ép trước sẽ biến nó thành 0.
+        line: z.coerce.number().int().nullish(),
         message: z.string(),
       }),
     )
@@ -46,6 +50,14 @@ export type ContractResult<T> = { ok: true; value: T } | { ok: false; repairProm
 
 export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractResult<T> {
   const text = raw.trim();
+
+  // Mỗi lượt chạy là một `codex exec` MỚI, không có lịch sử hội thoại: câu sửa nói "câu trả lời
+  // trước của bạn sai" mà không kèm chính câu đó thì model không có gì để sửa. Cắt ở 4000 ký tự
+  // để câu sửa không phình theo câu trả lời hỏng (thường là cả một payload bị cắt cụt).
+  const clipped = text.length > 4000
+    ? `${text.slice(0, 4000)}\n[... truncated ${text.length - 4000} more characters]`
+    : text || '(empty)';
+  const rejected = `\n\nYour previous reply was:\n<rejected_reply>\n${clipped}\n</rejected_reply>`;
 
   // Output của model là prose, hàng rào ``` và JSON trộn theo thứ tự bất kỳ — và một
   // giá trị chuỗi TRONG JSON hoàn toàn có thể chứa khối ``` của chính nó, vì ta bảo
@@ -102,8 +114,11 @@ export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractRes
         }
       }
     }
-    // Dấu mở không bao giờ đóng (payload bị cắt cụt): mọi dấu mở phía sau đều nằm bên
-    // trong nó, quét tiếp chỉ tốn thời gian mà không đổi kết quả.
+    // Dấu mở không bao giờ đóng (payload bị cắt cụt): dừng quét ở đây. Đây là MỘT ĐÁNH ĐỔI CÓ
+    // CHỦ ĐÍCH, không phải tối ưu miễn phí — quét tiếp THÌ KẾT QUẢ CÓ ĐỔI: `prose { oops\n[{"a":1}]`
+    // bị bỏ sót, vì dấu `{` lẻ đứng trước nuốt mất mảng hợp lệ đứng sau nó. Ta chấp nhận mất ca
+    // đó để giữ vòng quét tuyến tính: thử lại từng dấu mở phía sau một dấu mở không đóng là
+    // O(n^2), mà payload cắt cụt có thể chứa hàng nghìn dấu mở. Câu sửa sẽ bảo model trả JSON thuần.
     if (!closed) break;
   }
 
@@ -112,7 +127,7 @@ export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractRes
       ok: false,
       repairPrompt:
         `Your previous reply was not valid JSON (${firstError}). ` +
-        `Reply with JSON only — no prose, no markdown fences.`,
+        `Reply with JSON only — no prose, no markdown fences.${rejected}`,
     };
   }
 
@@ -127,6 +142,6 @@ export function parseContract<T>(raw: string, schema: z.ZodType<T>): ContractRes
     ok: false,
     repairPrompt:
       `Your previous JSON did not match the required shape. ` +
-      `Fix exactly these problems and reply with JSON only:\n${detail}`,
+      `Fix exactly these problems and reply with JSON only:\n${detail}${rejected}`,
   };
 }

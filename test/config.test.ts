@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, ROLE_SANDBOX } from '../src/config.ts';
@@ -100,4 +100,71 @@ test('runner claude với provider lạ thì từ chối', () => {
     roles: { ...GOOD.roles, reviewer: { runner: 'claude', provider: 'unknown', model: 'sonnet' } },
   };
   assert.throws(() => loadConfig(writeCfg(bad)), /is not declared in providers/);
+});
+
+// --- Khoảng hở của schema: file này do người dùng gõ tay nên lỗi gõ phải kêu lên ---
+
+test('khoá gõ sai ở mọi cấp bị từ chối, và thông báo gọi đúng tên khoá đó', () => {
+  const cases: Array<[string, unknown, RegExp]> = [
+    ['gốc', { ...GOOD, maxRound: 5 }, /Unrecognized key: "maxRound"/],
+    ['binaries', { ...GOOD, binaries: { codex: '/bin/echo', codx: '/bin/echo' } },
+      /binaries: Unrecognized key: "codx"/],
+    ['providers.<tên>',
+      { ...GOOD, providers: { greennode: { baseUrl: 'https://x', apiKeyEnv: 'K', baseURL: 'z' } } },
+      /providers\.greennode: Unrecognized key: "baseURL"/],
+    ['roles', { ...GOOD, roles: { ...GOOD.roles, codr: GOOD.roles.coder } },
+      /roles: Unrecognized key: "codr"/],
+    ['roles.coder', { ...GOOD, roles: { ...GOOD.roles, coder: { ...GOOD.roles.coder, modle: 'x' } } },
+      /roles\.coder: Unrecognized key: "modle"/],
+    ['timeouts', { ...GOOD, timeouts: { coderr: 5 } }, /timeouts: Unrecognized key: "coderr"/],
+  ];
+  for (const [level, bad, want] of cases) {
+    assert.throws(() => loadConfig(writeCfg(bad)), want, `cấp ${level}`);
+  }
+});
+
+test('effort vẫn là khoá hợp lệ của vai — strict không được chặn nhầm khoá có thật', () => {
+  const cfg = loadConfig(writeCfg({
+    ...GOOD, roles: { ...GOOD.roles, reviewer: { ...GOOD.roles.reviewer, effort: 'xhigh' } },
+  }));
+  assert.equal(cfg.roles.reviewer.effort, 'xhigh');
+});
+
+test('provider là chuỗi rỗng thì từ chối thay vì lọt qua bước kiểm provider đã khai báo', () => {
+  const bad = { ...GOOD, roles: { ...GOOD.roles, reviewer: { runner: 'codex', provider: '', model: 'm' } } };
+  assert.throws(() => loadConfig(writeCfg(bad)), /roles\.reviewer\.provider/);
+});
+
+test('timeouts có trần 86400 giây — hạn khổng lồ làm Node kẹp timer khiến mọi lượt hết giờ ngay', () => {
+  assert.equal(loadConfig(writeCfg({ ...GOOD, timeouts: { coder: 86400 } })).timeouts.coder, 86400);
+  for (const key of ['splitter', 'reviewer', 'coder']) {
+    assert.throws(
+      () => loadConfig(writeCfg({ ...GOOD, timeouts: { [key]: 86401 } })),
+      new RegExp(`timeouts\\.${key}`),
+      `timeouts.${key} = 86401 phải bị từ chối`,
+    );
+  }
+});
+
+test('binary trỏ vào thư mục thì từ chối — existsSync nhận cả thư mục', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcg-bin-'));
+  assert.throws(
+    () => loadConfig(writeCfg({ ...GOOD, binaries: { codex: dir } })),
+    /binaries\.codex is not a file/,
+  );
+});
+
+test('binary là file nhưng không có quyền thực thi thì từ chối, cấp quyền rồi thì nhận', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcg-bin-'));
+  const f = join(dir, 'codex');
+  writeFileSync(f, '#!/bin/sh\n');
+  chmodSync(f, 0o644);
+  assert.throws(
+    () => loadConfig(writeCfg({ ...GOOD, binaries: { codex: f } })),
+    /binaries\.codex is not executable/,
+  );
+  // Cùng file, chỉ thêm quyền thực thi: chứng tỏ lần từ chối trên là do quyền chứ không do
+  // lý do nào khác (đường dẫn sai, schema...).
+  chmodSync(f, 0o755);
+  assert.equal(loadConfig(writeCfg({ ...GOOD, binaries: { codex: f } })).binaries.codex, f);
 });
