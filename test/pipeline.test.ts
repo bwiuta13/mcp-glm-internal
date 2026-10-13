@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { createJob, releaseJob } from '../src/jobs.ts';
+import { createJob, releaseJob, cancelJob } from '../src/jobs.ts';
 import { runPipeline } from '../src/pipeline.ts';
 
 const SCRIPTED = resolve(import.meta.dirname, 'fixtures/scripted-codex.sh');
@@ -73,7 +73,7 @@ test('mỗi task có mốc diff gốc; bật snapshotUntracked thì chép file c
   const job = createJob('ke hoach', dir);
   await runPipeline(job, cfg);
 
-  const taskDir = join(job.dir, 'task-1');
+  const taskDir = join(job.dir, 'task-1-1');
   assert.ok(existsSync(join(taskDir, 'baseline.diff')));
   assert.equal(
     readFileSync(join(taskDir, 'untracked-before', 'chua-theo-doi.txt'), 'utf8'),
@@ -91,6 +91,23 @@ test('review fail hết maxRounds thì thành needs_human chứ không treo', as
   assert.equal(job.tasks[0].state, 'needs_human');
   assert.equal(job.tasks[0].round, 2);
   releaseJob(job);
+});
+
+test('huỷ giữa chừng thì pipeline dừng, không spawn thêm agent nào', async () => {
+  chmodSync(SCRIPTED, 0o755);
+  const sd = scriptDir([ONE_TASK, 'code', PASS, 'code', PASS]);
+  const { cfg, dir } = cfgWith(sd);
+  const job = createJob('ke hoach', dir);
+  const running = runPipeline(job, cfg);
+  // Chờ splitter xong rồi mới huỷ, để chắc chắn đang ở giữa pipeline.
+  for (let i = 0; i < 150 && job.tasks.length === 0; i++) {
+    await new Promise((res) => setTimeout(res, 20));
+  }
+  cancelJob(job.id);
+  await running;
+  assert.equal(job.state, 'cancelled', 'không được ghi đè thành done hay failed');
+  const used = Number(readFileSync(join(sd, 'counter'), 'utf8').trim());
+  assert.ok(used <= 3, `đã gọi ${used} lượt agent sau khi huỷ — phải dừng hẳn`);
 });
 
 test('splitter trả JSON hỏng 3 lần thì job failed', async () => {

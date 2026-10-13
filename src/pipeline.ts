@@ -77,8 +77,12 @@ export async function runPipeline(
       appendEvent(job, { type: 'split.attempt', attempt });
       const r = await runRole('splitter', cfg, {
         prompt: splitPrompt, cwd: job.cwd, guardHome, outFile: out(`split-${attempt}.txt`),
-        onSpawn: (c) => job.children.add(c),
+        onSpawn: (c) => { job.children.add(c); c.on('close', () => job.children.delete(c)); },
       });
+      // Huỷ giữa chừng: cancelJob đã giết con và nhả khoá. Không thoát ở đây thì
+      // coroutine này đi tiếp và spawn con workspace-write MỚI sau khi người dùng đã
+      // thấy "Cancelled" — và một job khác có thể đang giữ khoá thư mục đó rồi.
+      if (job.state === 'cancelled') return;
       const parsed = parseContract(r.lastMessage, TaskListSchema);
       if (parsed.ok) { tasks = parsed.value; break; }
       appendEvent(job, { type: 'split.invalid', attempt, reason: parsed.repairPrompt });
@@ -105,9 +109,11 @@ export async function runPipeline(
 
     // ---------- CODE → REVIEW → FIX ----------
     job.state = 'running';
-    for (const t of job.tasks) {
+    for (const [idx, t] of job.tasks.entries()) {
       job.current = t.item.id;
-      const taskDir = join(job.dir, `task-${t.item.id}`);
+      // Tên theo VỊ TRÍ, không theo id: hai task trùng id — hoặc "A" và "a" trên APFS
+      // không phân biệt hoa thường — sẽ dùng chung một thư mục log và ghi đè nhau.
+      const taskDir = join(job.dir, `task-${idx + 1}-${t.item.id}`);
       mkdirSync(taskDir, { recursive: true });
 
       // Mốc gốc để lùi về đầu task bằng `git apply -R`.
@@ -147,8 +153,9 @@ export async function runPipeline(
         const coded = await runRole('coder', cfg, {
           prompt: CODE_PROMPT(t.item, guidance), cwd: job.cwd, guardHome,
           outFile: join(taskDir, `round-${round}.msg`),
-          onSpawn: (c) => job.children.add(c),
+          onSpawn: (c) => { job.children.add(c); c.on('close', () => job.children.delete(c)); },
         });
+        if (job.state === 'cancelled') return;
         writeFileSync(join(taskDir, `round-${round}.stdout`), coded.stdout);
         if (coded.timedOut) {
           t.state = 'timeout';
@@ -168,8 +175,9 @@ export async function runPipeline(
           const r = await runRole('reviewer', cfg, {
             prompt: reviewPrompt, cwd: job.cwd, guardHome,
             outFile: join(taskDir, `round-${round}.review-${attempt}.msg`),
-            onSpawn: (c) => job.children.add(c),
+            onSpawn: (c) => { job.children.add(c); c.on('close', () => job.children.delete(c)); },
           });
+          if (job.state === 'cancelled') return;
           const parsed = parseContract(r.lastMessage, ReviewSchema);
           if (parsed.ok) { review = parsed.value; break; }
           reviewPrompt = `${REVIEW_PROMPT(t.item, diff)}\n\n${parsed.repairPrompt}`;
@@ -204,6 +212,8 @@ export async function runPipeline(
     job.state = 'done';
     appendEvent(job, { type: 'job.done' });
   } catch (e) {
+    // Bị huỷ thì giữ nguyên 'cancelled', đừng báo thành 'failed'.
+    if (job.state === 'cancelled') return;
     job.state = 'failed';
     job.error = (e as Error).message;
     appendEvent(job, { type: 'job.failed', error: job.error });
