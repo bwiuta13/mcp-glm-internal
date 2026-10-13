@@ -41,8 +41,15 @@ Nothing is ever committed or pushed — the repo owner reviews the final diff an
   guard layers at once).
 - **Hard coder constraint**: the coder role must use the `codex` runner, because the
   execpolicy guard only applies there.
-- **Group kill**: child processes are spawned detached and killed by process group, so
-  a timed-out agent cannot leave orphaned grandchildren with file-write access.
+- **Group kill, with one gap**: child processes are spawned detached, and on timeout or
+  cancel the whole process group is killed — so a grandchild *inside* that group dies with
+  its parent. A grandchild that leaves the group (`setsid`, a daemonizing dev server or
+  test watcher) is **not** killed: the pipeline only abandons its own end of the pipes and
+  moves on, it does not wait for that process. A task that starts a detached background
+  process can therefore leave it running after the job ends or is cancelled. It still runs
+  under the coder's `workspace-write` sandbox, which allows writes to the working
+  directory, so it can keep modifying your files. Check for stray processes after such a
+  task.
 - **Per-cwd lock**: only one job at a time per working directory — in-process and,
   additionally, cross-process via a lock file keyed on the normalized path.
 - **Tree-snapshot baselines**: before each task the working tree is snapshotted into a
@@ -54,6 +61,40 @@ Nothing is ever committed or pushed — the repo owner reviews the final diff an
   Optionally (`snapshotUntracked: true`) untracked files are copied aside as well.
 - **A git work tree is required**: a job in a non-git directory fails immediately, before
   any agent runs, because there would be no way to recover from it.
+
+## Recovering after a cancel or a bad run
+
+The coder edits files in place and nothing is ever committed, so a job's log directory is
+your only safety net: `~/.mcp-coding-glm/jobs/<job_id>/task-<n>-<id>/` (`<n>` is the task's
+position, `<id>` the id the splitter gave it — usually `task-1-1` for the first task).
+
+- `baseline.tree` — a git tree id: the whole working tree as it was before that task started.
+- `round-N.diff` — that round's delta, written as soon as the coder returns.
+
+**If a job is cancelled while the coder is running, that in-flight round's `round-N.diff` is
+never written** — only `baseline.tree` exists. (Cancelled during the review step, the diff
+for that round is already on disk.) You can still see what the task changed. From the
+project directory:
+
+```sh
+git diff "$(cat ~/.mcp-coding-glm/jobs/<job_id>/task-1-1/baseline.tree)"
+```
+
+That shows edits to, and deletions of, existing files. It does **not** show files the task
+newly created (`git diff` never lists untracked files); list those with
+`git ls-files --others --exclude-standard`. For the exact delta including new files — what
+the pipeline itself diffs — use a throwaway index, which leaves your real one untouched:
+
+```sh
+( export GIT_INDEX_FILE="$(mktemp -u)"
+  git add -A
+  git diff --binary "$(cat ~/.mcp-coding-glm/jobs/<job_id>/task-1-1/baseline.tree)" "$(git write-tree)"
+  rm -f "$GIT_INDEX_FILE" )
+```
+
+The baseline tree is an **unreferenced** git object. An ordinary `git gc` keeps it for the
+grace period (`gc.pruneExpire`, two weeks by default), but `git gc --prune=now` deletes it
+immediately.
 
 ## Requirements
 
@@ -72,6 +113,10 @@ This writes a sample config to `~/.mcp-coding-glm/config.json`, copies the three
 skills into `~/.codex/skills/`, and registers the server with `codex mcp add` using
 **absolute paths** (GUI apps don't inherit shell PATH).
 
+The one secret the server needs is the coder provider's API key, passed through the
+environment — see [`env.example`](env.example) for the variable name and where it
+belongs (`[mcp_servers.coding-glm]` → `env` in `~/.codex/config.toml`).
+
 ## Configuration
 
 Single source of truth: `~/.mcp-coding-glm/config.json`.
@@ -86,8 +131,8 @@ Single source of truth: `~/.mcp-coding-glm/config.json`.
     }
   },
   "roles": {
-    "splitter": { "runner": "codex", "provider": "openai", "model": "gpt-5.6-sol", "effort": "xhigh" },
-    "reviewer": { "runner": "codex", "provider": "openai", "model": "gpt-5.6-sol", "effort": "xhigh" },
+    "splitter": { "runner": "codex", "provider": "openai", "model": "gpt-5.6-sol" },
+    "reviewer": { "runner": "codex", "provider": "openai", "model": "gpt-5.6-sol" },
     "coder":    { "runner": "codex", "provider": "greennode", "model": "z-ai/glm-5.3" }
   },
   "maxRounds": 3,
@@ -96,8 +141,15 @@ Single source of truth: `~/.mcp-coding-glm/config.json`.
 }
 ```
 
-- Binary paths must be **absolute** and exist on disk.
+- Binary paths must be **absolute** and point to an existing, executable file.
 - `roles.coder.runner` must stay `"codex"` (the git guard depends on it).
+- `effort` applies to the `claude` runner only (it becomes `--effort`). On a `codex` role it
+  is accepted but has no effect, which is why the sample above leaves it out.
+- `timeouts` are in seconds, at most 86400.
+- The file is validated strictly: an unknown key (say, a `maxRound` typo) is an error, not
+  silently ignored.
+- **The config is read once, when the server starts.** After editing `config.json`, restart
+  Codex so it starts a fresh server.
 - The server is started as `node src/index.ts` — no build, no watchers.
 
 ## MCP tools
@@ -108,7 +160,7 @@ Single source of truth: `~/.mcp-coding-glm/config.json`.
 | `pipeline_start` | Start a job from an agreed plan; returns a `job_id` immediately |
 | `pipeline_status` | Poll job progress: state, current task, per-task state/round, log tail |
 | `pipeline_result` | Fetch the full result of a finished job, including per-task reviews |
-| `pipeline_cancel` | Kill a running job's process tree; modified files are left as they are |
+| `pipeline_cancel` | Kill a running job's process groups (see *Group kill* above for what can escape); modified files are left as they are |
 
 ## Codex skills
 
@@ -130,6 +182,18 @@ Tests run with Node's built-in runner: `node --test "test/**/*.test.ts"`. The su
 scripted fake binaries (`test/fixtures/`) to exercise the pipeline end-to-end without
 network access, plus a live guard test that runs real `codex execpolicy` checks when the
 `codex` binary is available.
+
+## Known limitations
+
+- **The coder has no network.** It runs under `workspace-write`, which in Codex means no
+  network access by default, so a task that needs `npm install` (or any download) will
+  fail — even though the coder prompt tells it to run the project's tests. Install
+  dependencies before starting the job.
+- **Detached background processes can outlive a job** — see *Group kill, with one gap*.
+- **Logs are never pruned.** `~/.mcp-coding-glm/jobs/` only grows, and a `round-N.diff` can
+  be large. Clear old job directories yourself.
+- **The `claude` runner is not verified end-to-end.** Its flags were checked against the real
+  CLI, but no test drives a real `claude` run.
 
 ## Project layout
 
@@ -154,5 +218,5 @@ that no commit is made, and that logs land in the right places.
 
 ## Status
 
-Working end-to-end with scripted binaries: 70/70 tests green. Real-model verification
+Working end-to-end with scripted binaries: 99/99 tests green. Real-model verification
 (the smoke test) is the remaining manual step.
