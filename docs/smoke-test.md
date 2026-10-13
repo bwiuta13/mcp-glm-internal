@@ -42,7 +42,7 @@ với plan: *"Tạo file sum.js xuất hàm sum(a,b) trả a+b, và sum.test.js 
 - [ ] `pipeline_status` cho thấy task chuyển `coding` → `reviewing` → `passed`
 - [ ] File thật được tạo trong `/tmp/mcg-smoke`
 - [ ] `git log` **không có commit mới** — lá chắn đã làm việc
-- [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1/round-1.diff` có nội dung
+- [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1-<task_id>/round-1.diff` có nội dung
 - [ ] `~/.codex/rules/` **không** bị thêm file nào — lá chắn đúng phạm vi
 
 ## 6. Nếu bước 5 có mục nào hỏng
