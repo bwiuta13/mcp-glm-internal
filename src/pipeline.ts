@@ -1,5 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Config } from './config.ts';
 import { parseContract, TaskListSchema, ReviewSchema, type Review } from './contract.ts';
@@ -49,12 +51,32 @@ or
 {"verdict":"fail","issues":[{"severity":"blocker","file":"a.ts","line":1,"message":"..."}],"guidance":"what to change next round"}
 ${JSON_ONLY}`;
 
-/** Lưới an toàn duy nhất: diff dạng văn bản. Thuần đọc, không đụng ref hay index. */
-function captureDiff(cwd: string): string {
+/**
+ * Chụp toàn bộ cây làm việc thành một git tree object. Đây là lưới an toàn DUY NHẤT của
+ * thiết kế này (sửa tại chỗ + cấm commit), nên nó phải thấy được mọi thứ.
+ *
+ * Vì sao không dùng `git diff` trần — đã đo, cả bốn ca đều hỏng im lặng:
+ *   - task chỉ TẠO FILE MỚI  -> diff 0 byte, reviewer bị bảo "(no changes were made)"
+ *   - repo có file nhị phân  -> `git apply -R` từ chối CẢ bản vá, kể cả hunk văn bản
+ *   - user đặt color.ui=always hay diff.noprefix -> bản vá vô dụng
+ *   - diff vượt maxBuffer    -> 0 byte, không sự kiện, không lỗi
+ *
+ * Dùng GIT_INDEX_FILE tạm: `git add -A` ghi vào index TẠM đó rồi `write-tree` biến nó
+ * thành tree. Index, status và ref thật không bị đụng; chỉ sinh object không ai tham
+ * chiếu, `git gc` sẽ dọn. Trả null khi cwd không phải git work tree.
+ */
+function snapshotTree(cwd: string): string | null {
+  const idx = join(tmpdir(), `mcg-idx-${randomUUID()}`);
+  const env = { ...process.env, GIT_INDEX_FILE: idx };
   try {
-    return execFileSync('git', ['diff'], { cwd, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+    execFileSync('git', ['add', '-A'], { cwd, env, stdio: ['ignore', 'ignore', 'ignore'] });
+    return execFileSync('git', ['write-tree'], {
+      cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
   } catch {
-    return '';
+    return null; // không phải repo git, hoặc git không chạy được
+  } finally {
+    rmSync(idx, { force: true });
   }
 }
 
@@ -63,11 +85,25 @@ export async function runPipeline(
   cfg: Config,
   opts: { dryRun?: boolean; only?: string[]; maxRounds?: number } = {},
 ): Promise<void> {
-  const maxRounds = opts.maxRounds ?? cfg.maxRounds;
-  const guardHome = ensureGuardHome();
-  const out = (name: string) => join(job.dir, name);
+  // Clamp: maxRounds = 0 hay NaN khiến mọi task đứng yên ở 'pending' mà job vẫn báo 'done'.
+  const asked = opts.maxRounds ?? cfg.maxRounds;
+  const maxRounds = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 10) : 1;
 
   try {
+    // PHẢI nằm trong try: ném ra ngoài đây thì job kẹt ở 'queued', khoá không bao giờ
+    // được nhả, và `void runPipeline(...)` ở index.ts làm sập cả tiến trình MCP.
+    const guardHome = ensureGuardHome();
+
+    // Không phải repo git thì KHÔNG có lưới an toàn nào. Báo to ngay, đừng để người dùng
+    // phát hiện lúc cần lùi lại.
+    if (snapshotTree(job.cwd) === null) {
+      job.state = 'failed';
+      job.error =
+        `${job.cwd} is not a git work tree. This pipeline edits in place and never commits, ` +
+        `so a git repository is the only way to recover. Run \`git init\` first.`;
+      appendEvent(job, { type: 'job.failed', error: job.error });
+      return;
+    }
     // ---------- SPLIT ----------
     job.state = 'splitting';
     let splitPrompt = SPLIT_PROMPT(job.plan);
@@ -76,7 +112,8 @@ export async function runPipeline(
     for (let attempt = 1; attempt <= 3; attempt++) {
       appendEvent(job, { type: 'split.attempt', attempt });
       const r = await runRole('splitter', cfg, {
-        prompt: splitPrompt, cwd: job.cwd, guardHome, outFile: out(`split-${attempt}.txt`),
+        prompt: splitPrompt, cwd: job.cwd, guardHome,
+        outFile: join(job.dir, `split-${attempt}.txt`),
         onSpawn: (c) => { job.children.add(c); c.on('close', () => job.children.delete(c)); },
       });
       // Huỷ giữa chừng: cancelJob đã giết con và nhả khoá. Không thoát ở đây thì
@@ -85,7 +122,10 @@ export async function runPipeline(
       if (job.state === 'cancelled') return;
       const parsed = parseContract(r.lastMessage, TaskListSchema);
       if (parsed.ok) { tasks = parsed.value; break; }
-      appendEvent(job, { type: 'split.invalid', attempt, reason: parsed.repairPrompt });
+      writeFileSync(join(job.dir, `split-${attempt}.stderr`), r.stderr);
+      appendEvent(job, {
+        type: 'split.invalid', attempt, code: r.exitCode, reason: parsed.repairPrompt,
+      });
       splitPrompt = `${SPLIT_PROMPT(job.plan)}\n\n${parsed.repairPrompt}`;
     }
 
@@ -100,6 +140,14 @@ export async function runPipeline(
       .filter((item) => !opts.only || opts.only.includes(item.id))
       .map((item) => ({ item, state: 'pending' as const, round: 0 }));
     appendEvent(job, { type: 'split.done', count: job.tasks.length });
+    if (job.tasks.length === 0) {
+      job.state = 'failed';
+      job.error = opts.only
+        ? `No task matched only=[${opts.only.join(', ')}]`
+        : 'Splitter returned an empty task list';
+      appendEvent(job, { type: 'job.failed', error: job.error });
+      return;
+    }
 
     if (opts.dryRun) {
       job.state = 'done';
@@ -116,8 +164,9 @@ export async function runPipeline(
       const taskDir = join(job.dir, `task-${idx + 1}-${t.item.id}`);
       mkdirSync(taskDir, { recursive: true });
 
-      // Mốc gốc để lùi về đầu task bằng `git apply -R`.
-      writeFileSync(join(taskDir, 'baseline.diff'), captureDiff(job.cwd));
+      // Mốc gốc của task: chụp cây TRƯỚC khi coder động vào bất cứ thứ gì.
+      const treeBefore = snapshotTree(job.cwd);
+      writeFileSync(join(taskDir, 'baseline.tree'), String(treeBefore));
 
       // git diff không nhìn thấy file chưa từng được theo dõi; chép lại trước khi bị ghi đè.
       if (cfg.snapshotUntracked) {
@@ -125,9 +174,11 @@ export async function runPipeline(
         mkdirSync(snapDir, { recursive: true });
         let untracked: string[] = [];
         try {
-          untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], {
-            cwd: job.cwd, encoding: 'utf8',
-          }).split('\n').filter(Boolean);
+          // -z: không có nó, git bọc tên có dấu hoặc dấu nháy trong "..." và ta bỏ sót
+          // im lặng — đã đo: 'chưa-theo-dõi.txt' bị bỏ qua mà vẫn báo đã chép.
+          untracked = execFileSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
+            cwd: job.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+          }).split('\0').filter(Boolean);
         } catch {
           // không phải repo git — không có gì để liệt kê
         }
@@ -157,18 +208,50 @@ export async function runPipeline(
         });
         if (job.state === 'cancelled') return;
         writeFileSync(join(taskDir, `round-${round}.stdout`), coded.stdout);
+        // Giữ cả stderr và mã thoát: không có chúng, một agent thoát 1 vì
+        // "401 Unauthorized" chỉ hiện ra thành "did not return valid JSON".
+        writeFileSync(join(taskDir, `round-${round}.stderr`), coded.stderr);
+        appendEvent(job, { type: 'coder.exit', id: t.item.id, round, code: coded.exitCode });
+
+        // Chụp TRƯỚC khi xử lý timeout: coder hết giờ vẫn có thể đã sửa dở file, và đó
+        // chính là lúc cần bản vá để lùi lại nhất.
+        const treeAfter = snapshotTree(job.cwd);
+        let diff = '';
+        if (treeBefore && treeAfter) {
+          try {
+            // So hai tree -> delta ĐÚNG CỦA TASK NÀY, không lẫn việc của task trước và
+            // không lẫn thay đổi người dùng đã có sẵn. --binary để bản vá dùng lại được.
+            diff = execFileSync('git', [
+              '-c', 'core.quotePath=false', 'diff', '--binary', '--no-color', '--no-ext-diff',
+              treeBefore, treeAfter,
+            ], {
+              cwd: job.cwd, encoding: 'utf8',
+              maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+            });
+          } catch (e) {
+            appendEvent(job, {
+              type: 'diff.failed', id: t.item.id, round, error: (e as Error).message,
+            });
+          }
+        }
+        writeFileSync(join(taskDir, `round-${round}.diff`), diff);
+
         if (coded.timedOut) {
           t.state = 'timeout';
           appendEvent(job, { type: 'task.timeout', id: t.item.id, round });
           break;
         }
 
-        const diff = captureDiff(job.cwd);
-        writeFileSync(join(taskDir, `round-${round}.diff`), diff);
-
         t.state = 'reviewing';
         appendEvent(job, { type: 'task.reviewing', id: t.item.id, round });
-        let reviewPrompt = REVIEW_PROMPT(t.item, diff);
+        // argv của macOS chặn quanh 1MiB: một diff ~2MB làm spawn ném E2BIG, job thành
+        // 'failed' và mọi task sau không bao giờ chạy. Cắt bớt, chỉ đường tới bản đầy đủ.
+        const CAP = 200_000;
+        const shown = diff.length > CAP
+          ? `${diff.slice(0, CAP)}\n\n[... cắt bớt ${diff.length - CAP} ký tự. ` +
+            `Bản đầy đủ: ${join(taskDir, `round-${round}.diff`)} ...]`
+          : diff;
+        let reviewPrompt = REVIEW_PROMPT(t.item, shown);
         let review: Review | null = null;
 
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -180,7 +263,8 @@ export async function runPipeline(
           if (job.state === 'cancelled') return;
           const parsed = parseContract(r.lastMessage, ReviewSchema);
           if (parsed.ok) { review = parsed.value; break; }
-          reviewPrompt = `${REVIEW_PROMPT(t.item, diff)}\n\n${parsed.repairPrompt}`;
+          appendEvent(job, { type: 'review.invalid', id: t.item.id, round, attempt });
+          reviewPrompt = `${REVIEW_PROMPT(t.item, shown)}\n\n${parsed.repairPrompt}`;
         }
 
         if (!review) {
@@ -198,7 +282,13 @@ export async function runPipeline(
           break;
         }
 
-        guidance = review.guidance || review.issues.map((i) => `${i.severity}: ${i.message}`).join('\n');
+        guidance =
+          review.guidance ||
+          review.issues.map((i) => `${i.severity}: ${i.message}`).join('\n') ||
+          // Không có lời nào thì prompt vòng sau sẽ y hệt vòng trước — thử mù, phí một
+          // lượt agent. Ít nhất phải nói cho coder biết nó đã bị từ chối.
+          'The previous attempt was rejected but the reviewer gave no reason. ' +
+            'Re-read the task and verify the acceptance criterion yourself before replying.';
         appendEvent(job, { type: 'task.rejected', id: t.item.id, round, guidance });
         // Hết vòng mà vẫn fail thì cần người xem — nhưng không treo cả pipeline.
         if (round === maxRounds) {
