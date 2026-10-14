@@ -151,10 +151,36 @@ test('provider tuỳ chỉnh luôn khai wire_api responses và đủ bốn khoá
   assert.ok(argv.includes('model_provider="gn"'));
 });
 
-test('provider openai dựng sẵn thì không sinh cờ -c nào', async () => {
+test('provider openai dựng sẵn thì không sinh cờ -c model_provider nào', async () => {
   const { argv } = await argvOf('coder', null);
-  assert.ok(!argv.includes('-c'));
+  // `-c approval_policy` vẫn phải có (con headless không được treo chờ phê duyệt),
+  // nhưng KHÔNG được sinh cờ provider nào cho openai dựng sẵn.
+  assert.ok(!argv.some((a) => a.includes('model_provider')), 'không được khai lại provider openai');
   assert.equal(argv[argv.indexOf('-m') + 1], 'm2');
+});
+
+test('mọi vai đều chạy approval_policy=never — con headless không treo chờ phê duyệt', async () => {
+  for (const role of ['splitter', 'reviewer', 'coder'] as const) {
+    const { argv } = await argvOf(role, 'gn');
+    assert.ok(
+      argv.includes('approval_policy="never"'),
+      `vai ${role} thiếu approval_policy="never" — sẽ treo chờ Approve đến hết timeout`,
+    );
+    // Cờ này không được đi kèm --approve-for-me: flag đó xung đột với -s và làm CLI hỏng ngay.
+    assert.ok(!argv.includes('--approve-for-me'));
+  }
+});
+
+test('chỉ vai workspace-write được cấp network, vai read-only thì không', async () => {
+  for (const [role, want] of [['coder', true], ['splitter', false], ['reviewer', false]] as const) {
+    const { argv } = await argvOf(role, 'gn');
+    const has = argv.includes('sandbox_workspace_write.network_access=true');
+    assert.equal(has, want, `vai ${role}`);
+    if (!want) {
+      // network_access chỉ hợp lệ dưới sandbox workspace-write; ghim cả việc nó vắng mặt
+      assert.ok(!argv.some((a) => a.includes('network_access')), `vai ${role} không được có network_access`);
+    }
+  }
 });
 
 test('CODEX_HOME trỏ guard home, PATH được nối thêm chứ không thay thế', async () => {

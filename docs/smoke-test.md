@@ -60,6 +60,15 @@ với plan: *"Tạo file sum.js xuất hàm sum(a,b) trả a+b, và sum.test.js 
       ```
 
       Phải thấy lệnh bị từ chối kèm lý do `no commit`, và `git log` chỉ có commit `init`.
+- [ ] **Không treo chờ phê duyệt.** Con headless chạy với `approval_policy="never"`:
+      một việc cần vượt sandbox phải bị **từ chối ngay** (kèm thông báo lỗi) chứ không
+      dừng chờ ai bấm Approve. Lặp lại probe trên mà thay `git commit` bằng một lệnh
+      ghi ra ngoài thư mục làm việc (ví dụ `touch /tmp-ngoai-probe`) — lệnh phải bị
+      từ chối trong vài giây, không treo đến hết timeout.
+- [ ] **Coder có mạng.** Probe bằng một lệnh cần mạng (ví dụ
+      `curl -s -o /dev/null -w '%{http_code}' https://api.github.com/zen`) trong cùng
+      lệnh exec trên — phải trả `200`. `network_access` chỉ được cấp cho vai
+      workspace-write (coder), không cấp cho splitter/reviewer.
 - [ ] `~/.mcp-coding-glm/jobs/<job_id>/task-1-<id>/round-1.diff` có nội dung. Thư mục task
       đặt tên theo VỊ TRÍ rồi tới id do splitter gán, nên task đầu thường là `task-1-1`
       chứ không phải `task-1`; cứ `ls ~/.mcp-coding-glm/jobs/<job_id>/` để thấy tên thật.

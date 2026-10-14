@@ -39,6 +39,15 @@ Nothing is ever committed or pushed — the repo owner reviews the final diff an
 - **Role-locked sandboxes**: splitter and reviewer always run `read-only`; the coder
   always runs `workspace-write`. `danger-full-access` is never used (it disables both
   guard layers at once).
+- **No approvals, by construction**: children run headless with
+  `approval_policy="never"` — there is no one to click "Approve", and with any other
+  policy a child that wants to step outside its sandbox pauses and hangs until the
+  role timeout kills it. Under `never` the same request is **denied immediately**
+  instead of waiting; the sandbox itself still holds. (`--approve-for-me` cannot be
+  used: it conflicts with `-s` on this CLI version.)
+- **Coder network access**: the coder runs with
+  `sandbox_workspace_write.network_access=true`, so `npm install` and test runs that
+  need downloads work without lifting the sandbox. Read-only roles get no network.
 - **Hard coder constraint**: the coder role must use the `codex` runner, because the
   execpolicy guard only applies there.
 - **Group kill, with one gap**: child processes are spawned detached, and on timeout or
@@ -195,10 +204,9 @@ network access, plus a live guard test that runs real `codex execpolicy` checks 
 
 ## Known limitations
 
-- **The coder has no network.** It runs under `workspace-write`, which in Codex means no
-  network access by default, so a task that needs `npm install` (or any download) will
-  fail — even though the coder prompt tells it to run the project's tests. Install
-  dependencies before starting the job.
+- **Install dependencies before a job if it needs them.** The coder now has network
+  access (`sandbox_workspace_write.network_access=true`), so `npm install` works during
+  a task, but pre-installed dependencies make rounds faster and cheaper.
 - **Detached background processes can outlive a job** — see *Group kill, with one gap*.
 - **Logs are never pruned.** `~/.mcp-coding-glm/jobs/` only grows, and a `round-N.diff` can
   be large. Clear old job directories yourself.

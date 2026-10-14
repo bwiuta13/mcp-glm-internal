@@ -78,6 +78,17 @@ export type RunOpts = {
   onSpawn?: (child: ChildProcess) => void;
 };
 
+/**
+ * Con chạy headless: không có ai bấm "Approve". Với approval_policy mặc định,
+ * codex con dừng lại chờ phê duyệt và treo đến hết timeout. `approval_policy="never"`
+ * bảo nó cứ chạy trong sandbox, việc cần vượt sandbox sẽ bị TỪ CHỐI thay vì treo —
+ * `-c` ghi đè config, ghép được với `-s` (khác `--approve-for-me` vốn xung đột flag).
+ *
+ * Coder còn cần mạng (npm install, chạy test): `network_access=true` chỉ hợp lệ
+ * khi sandbox_mode là workspace-write, nên chỉ bật cho vai có sandbox đó.
+ */
+const APPROVAL_NEVER = ['-c', 'approval_policy="never"'];
+
 export function runRole(role: Role, cfg: Config, opts: RunOpts): Promise<RunResult> {
   const rc = cfg.roles[role];
   const timeoutMs = cfg.timeouts[role] * 1000;
@@ -100,6 +111,10 @@ export function runRole(role: Role, cfg: Config, opts: RunOpts): Promise<RunResu
       'exec', '--skip-git-repo-check',
       '-C', opts.cwd,
       '-s', ROLE_SANDBOX[role],
+      ...APPROVAL_NEVER,
+      ...(ROLE_SANDBOX[role] === 'workspace-write'
+        ? ['-c', 'sandbox_workspace_write.network_access=true']
+        : []),
       '--json',
       '-o', opts.outFile,
       '-m', rc.model,
