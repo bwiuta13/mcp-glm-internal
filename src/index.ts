@@ -5,6 +5,7 @@ import { existsSync, statSync } from 'node:fs';
 import { loadConfig, DEFAULT_CONFIG_PATH, type Config } from './config.ts';
 import { createJob, getJob, cancelJob, readTail } from './jobs.ts';
 import { runPipeline } from './pipeline.ts';
+import { providerKeyAvailable } from './runner.ts';
 
 // `isError` chỉ gắn cho reply THẤT BẠI (job không tồn tại, config hỏng, cwd sai, khoá đang giữ...):
 // không có nó, host coi mọi lỗi là kết quả thành công và không có tín hiệu nào để xử lý khác đi.
@@ -47,8 +48,11 @@ server.registerTool(
     if (!cached) return text(`Config not usable.\n${configError}`, true);
     const rows = Object.entries(cached.roles).map(([role, rc]) => {
       const bin = rc.runner === 'codex' ? cached!.binaries.codex : cached!.binaries.claude;
+      const key = rc.provider && providerKeyAvailable(cached!, rc.provider)
+        ? ''
+        : rc.provider === 'openai' ? '' : ` key=MISSING`;
       return `${role}: runner=${rc.runner} model=${rc.model}` +
-        `${rc.provider ? ` provider=${rc.provider}` : ''}` +
+        `${rc.provider ? ` provider=${rc.provider}` : ''}${key}` +
         ` binary=${bin} ${bin && existsSync(bin) ? 'OK' : 'MISSING'}`;
     });
     return text(
@@ -120,6 +124,22 @@ server.registerTool(
         if (rc.provider && rc.provider !== 'openai' && !effective.providers[rc.provider]) {
           return text(`roles.${role}.provider "${rc.provider}" is not declared in providers`, true);
         }
+      }
+    }
+
+    // Fail-fast khi thiếu API key: không có bước này thì job vẫn khởi động, coder chết
+    // ở MỌI vòng với "Missing environment variable: ...", cháy trọn maxRounds lượt
+    // (đã đo thật: job e8a38182 cháy 3 vòng chỉ vì thế) rồi mới về needs_human.
+    for (const [role, rc] of Object.entries(effective.roles)) {
+      if (!rc.provider || !providerKeyAvailable(effective, rc.provider)) {
+        return text(
+          `roles.${role} uses provider "${rc.provider}" but its API key is missing: ` +
+          `neither env ${effective.providers[rc.provider!].apiKeyEnv} nor the .env file at the ` +
+          `mcp-coding-glm repo root provides it. Set it in the env of the MCP server entry ` +
+          `(~/.codex/config.toml → [mcp_servers.coding-glm] → env) or in ` +
+          `${import.meta.dirname}/../.env, then restart the server.`,
+          true,
+        );
       }
     }
 

@@ -7,5 +7,7 @@ out="$RECORD_TO"
   echo "ARGV_END"
   echo "CODEX_HOME=$CODEX_HOME"
   echo "PATH=$PATH"
+  echo "ENV_KEY=$ENV_KEY"
+  echo "GN_KEY=$GN_KEY"
 } > "$out"
 exit 0

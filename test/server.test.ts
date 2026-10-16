@@ -135,7 +135,7 @@ test('ghi đè roles sai bị từ chối rõ ràng, có isError, và chưa tạ
       params: { name: 'pipeline_start', arguments: { plan: 'p', cwd: here, ...args } },
     })),
     JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'capabilities', arguments: {} } }),
-  ], { ...process.env, HOME: home });
+  ], { ...process.env, HOME: home, GN_KEY: 'sk-co-test' });
   const byId = new Map(out.map((l) => JSON.parse(l)).map((m) => [m.id, m]));
 
   cases.forEach(([label, , want], i) => {
@@ -151,4 +151,37 @@ test('ghi đè roles sai bị từ chối rõ ràng, có isError, và chưa tạ
   const caps = byId.get(99).result;
   assert.ok(!caps.isError, 'capabilities thành công mà bị đánh dấu lỗi');
   assert.match(caps.content[0].text, /splitter: runner=codex/);
+  // key có mặt (qua env) thì dòng vai không được dính chữ key=MISSING
+  for (const line of caps.content[0].text.split('\n')) {
+    if (line.includes('provider=gn')) {
+      assert.ok(!line.includes('MISSING'), `vai có key mà vẫn báo MISSING: ${line}`);
+    }
+  }
+});
+
+test('thiếu API key của provider thì pipeline_start từ chối ngay, không đốt vòng nào', async () => {
+  // Vá hỏng đã đo thật (job e8a38182, 13/10): server không mang env key, coder chết
+  // "Missing environment variable" ở MỌI vòng, cháy trọn maxRounds rồi mới needs_human.
+  // Bây giờ phải bị từ chối ngay từ pipeline_start.
+  const home = mkdtempSync(join(tmpdir(), 'mcg-home-'));
+  mkdirSync(join(home, '.mcp-coding-glm'));
+  writeFileSync(join(home, '.mcp-coding-glm', 'config.json'), JSON.stringify(OK_CONFIG));
+  const here = mkdtempSync(join(tmpdir(), 'mcg-cwd-'));
+  const env = { ...process.env, HOME: home };
+  delete env.GN_KEY; // buộc provider "gn" không còn nguồn key nào
+
+  const out = await rpc([
+    INIT, INITED,
+    JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'pipeline_start', arguments: { plan: 'p', cwd: here } },
+    }),
+  ], env);
+  const res = out.map((l) => JSON.parse(l)).find((m) => m.id === 2);
+  assert.equal(res.result?.isError, true, 'thiếu key mà vẫn start job');
+  assert.match(res.result.content[0].text, /API key is missing/);
+  assert.ok(
+    !existsSync(join(home, '.mcp-coding-glm', 'jobs')),
+    'bị từ chối vì thiếu key thì không được tạo thư mục job',
+  );
 });

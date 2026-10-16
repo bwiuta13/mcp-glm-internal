@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, readdirSync, statSync,
+  mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync, readdirSync, statSync, rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { runRole, ensureGuardHome, GUARD_RULES, type RunResult } from '../src/runner.ts';
+import {
+  runRole, ensureGuardHome, GUARD_RULES, readDotEnvKey, providerKeyAvailable, type RunResult,
+} from '../src/runner.ts';
 
 const FAKE = resolve(import.meta.dirname, 'fixtures/fake-codex.sh');
 
@@ -34,6 +36,55 @@ test('ensureGuardHome ghi đúng nội dung rules', () => {
   // của rule kế bên, nên hạ rule commit xuống "allow" mà test vẫn xanh.
   assert.match(body, /^prefix_rule\(pattern=\["git","commit"\], decision="forbidden"/m);
   assert.match(body, /^prefix_rule\(pattern=\["git","push"\], decision="forbidden"/m);
+});
+
+// --- readDotEnvKey / providerKeyAvailable: vá hỏng "Missing environment variable" ---
+
+test('readDotEnvKey đọc đúng dòng TÊN=giá_trị, bỏ comment và dòng trống', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcg-env-'));
+  writeFileSync(join(dir, '.env'), [
+    '# comment dòng đầu',
+    '',
+    'KHAC=a-b-c',
+    'GN_KEY=sk-demo-123',
+    '#GN_KEY=khong-tinh',
+    'TRONG_NGOAC_KEP="sk-trong-ngoac"',
+    'NGOAC_LE=hong-dong"',
+    'GIA_TRI_THUAN=sk-khong-ngoac',
+  ].join('\n'));
+  assert.equal(readDotEnvKey('GN_KEY', dir), 'sk-demo-123');
+  assert.equal(readDotEnvKey('TRONG_NGOAC_KEP', dir), 'sk-trong-ngoac');
+  assert.equal(readDotEnvKey('GIA_TRI_THUAN', dir), 'sk-khong-ngoac');
+  assert.equal(readDotEnvKey('KHONG_TON_TAI', dir), '');
+  // ngoặc kép hở một đầu KHÔNG phải cặp bao — giữ nguyên toàn bộ giá trị
+  assert.equal(readDotEnvKey('NGOAC_LE', dir), 'hong-dong"');
+  // không có file .env thì trả rỗng chứ không ném
+  assert.equal(readDotEnvKey('GN_KEY', mkdtempSync(join(tmpdir(), 'mcg-env2-'))), '');
+});
+
+test('providerKeyAvailable nhìn env tiến trình TRƯỚC, .env là fallback', () => {
+  const { cfg } = cfgWith();
+  const had = process.env.GN_KEY;
+  try {
+    // env rỗng: không còn nguồn nào trong cwd tạm của test
+    delete process.env.GN_KEY;
+    // .env mặc định trỏ về gốc repo mcp-coding-glm — nó có thể có GN_KEY thật hoặc
+    // không tuỳ máy; đằng nào giá trị cũng phải là boolean, và env thắng khi có.
+    const fromFile = providerKeyAvailable(cfg, 'greennode');
+    assert.equal(typeof fromFile, 'boolean');
+
+    // env tiến trình thắng
+    process.env.GN_KEY = 'sk-tu-env';
+    assert.equal(providerKeyAvailable(cfg, 'greennode'), true);
+
+    // openai dựng sẵn luôn sẵn sàng (xác thực qua auth.json)
+    assert.equal(providerKeyAvailable(cfg, 'openai'), true);
+
+    // provider lạ thì false
+    assert.equal(providerKeyAvailable(cfg, 'khongco'), false);
+  } finally {
+    if (had === undefined) delete process.env.GN_KEY; else process.env.GN_KEY = had;
+  }
 });
 
 test('ensureGuardHome thay file rules bằng rename chứ không cắt cụt tại chỗ', () => {
@@ -157,6 +208,43 @@ test('provider openai dựng sẵn thì không sinh cờ -c model_provider nào'
   // nhưng KHÔNG được sinh cờ provider nào cho openai dựng sẵn.
   assert.ok(!argv.some((a) => a.includes('model_provider')), 'không được khai lại provider openai');
   assert.equal(argv[argv.indexOf('-m') + 1], 'm2');
+});
+
+test('API key trong .env của repo được truyền xuống con khi env tiến trình rỗng', { skip: existsSync(join(import.meta.dirname, '..', '.env')) }, async () => {
+  // Vá hỏng đã đo thật (job e8a38182): host khởi động lại server không mang env key,
+  // mọi lượt coder chết "Missing environment variable". Bây giờ .env ở GỐC repo là
+  // nguồn dự phòng — con phải nhận được key từ đó.
+  // Skip khi .env thật đang tồn tại: test này phải TẠM ghi .env ở gốc repo, mà ghi đè
+  // file thật rồi xoá sẽ đốt key production. Máy dev có .env thì bỏ qua, máy CI sạch
+  // (không .env) thì chạy đủ.
+  writeFileSync(join(import.meta.dirname, '..', '.env'), 'GN_KEY=sk-fallback-tu-file\n');
+  const dir = mkdtempSync(join(tmpdir(), 'mcg-env4-'));
+  const p = join(dir, 'config.json');
+  writeFileSync(p, JSON.stringify({
+    binaries: { codex: RECORD },
+    providers: { greennode: { baseUrl: 'https://x/v1', apiKeyEnv: 'GN_KEY' } },
+    roles: {
+      splitter: { runner: 'codex', provider: 'greennode', model: 'm1' },
+      reviewer: { runner: 'codex', provider: 'greennode', model: 'm1' },
+      coder: { runner: 'codex', provider: 'greennode', model: 'm2' },
+    },
+  }));
+  chmodSync(RECORD, 0o755);
+  const rec = join(dir, 'rec-env.txt');
+  process.env.RECORD_TO = rec;
+  const had = process.env.GN_KEY;
+  delete process.env.GN_KEY;
+  try {
+    await runRole('coder', loadConfig(p), {
+      prompt: 'x', cwd: dir, guardHome: ensureGuardHome(dir), outFile: join(dir, 'o.txt'),
+    });
+  } finally {
+    if (had === undefined) delete process.env.GN_KEY; else process.env.GN_KEY = had;
+    delete process.env.RECORD_TO;
+    rmSync(join(import.meta.dirname, '..', '.env'), { force: true });
+  }
+  const body = readFileSync(rec, 'utf8');
+  assert.equal(body.split('GN_KEY=')[1].split('\n')[0], 'sk-fallback-tu-file');
 });
 
 test('mọi vai đều chạy approval_policy=never — con headless không treo chờ phê duyệt', async () => {

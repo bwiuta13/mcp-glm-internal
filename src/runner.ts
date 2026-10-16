@@ -5,7 +5,7 @@ import {
   existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { ROLE_SANDBOX, type Config, type Role } from './config.ts';
 
 /**
@@ -70,6 +70,48 @@ export type RunResult = {
   timedOut: boolean;
 };
 
+/**
+ * Fallback đọc API key từ file `.env` ở GỐC repo khi biến môi trường vắng mặt.
+ *
+ * Việc này vá đúng một hỏng đã đo thật (job e8a38182, 13/10): server được host
+ * khởi động lại mà không mang theo env key (mục env trong config MCP chỉ áp cho
+ * tiến trình đăng ký lúc đó) — mọi lượt coder chết với "Missing environment
+ * variable: `GREENNODE_API_KEY`", cháy hết ba vòng rồi `needs_human`, trong khi
+ * key vẫn còn nguyên trong `.env` của repo này.
+ *
+ * Chỉ nhận dòng `TÊN=giá_trị` — đúng dạng file .env của repo. Bỏ qua dòng trống
+ * và dòng `#` comment. Giá trị được strip khoảng trắng hai đầu, rồi bỏ cặp ngoặc
+ * kép bao trọn nếu có (thứ tự quan trọng: `" sk-x "` phải ra `sk-x`). KHÔNG dùng
+ * thư viện dotenv: server phải đứng vững khi node_modules chưa cài.
+ */
+export function readDotEnvKey(name: string, root: string = join(import.meta.dirname, '..')): string {
+  try {
+    const body = readFileSync(join(resolve(root), '.env'), 'utf8');
+    for (const line of body.split('\n')) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line.trim());
+      if (m && m[1] === name) {
+        const v = m[2].trim();
+        return v.length >= 2 && v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
+      }
+    }
+  } catch {
+    // không có file .env, hoặc không đọc được — trả rỗng để kẻ gọi quyết định
+  }
+  return '';
+}
+
+/**
+ * Kiểm tra key của một provider đã sẵn sàng chưa: có trong env của tiến trình,
+ * hoặc trong file `.env` của repo. Host có thể khởi động lại server mà không
+ * mang theo env, nên kiểm tra này phải nhìn CẢ HAI nguồn như runRole sẽ làm.
+ */
+export function providerKeyAvailable(cfg: Config, provider: string): boolean {
+  if (provider === 'openai') return true; // provider dựng sẵn, xác thực qua auth.json
+  const p = cfg.providers[provider];
+  if (!p) return false;
+  return Boolean(process.env[p.apiKeyEnv] || readDotEnvKey(p.apiKeyEnv));
+}
+
 export type RunOpts = {
   prompt: string;
   cwd: string;
@@ -128,7 +170,7 @@ export function runRole(role: Role, cfg: Config, opts: RunOpts): Promise<RunResu
         '-c', `model_providers.${rc.provider}.env_key="${p.apiKeyEnv}"`,
         '-c', `model_providers.${rc.provider}.wire_api="${p.wireApi}"`,
       );
-      env[p.apiKeyEnv] = process.env[p.apiKeyEnv] ?? '';
+      env[p.apiKeyEnv] = env[p.apiKeyEnv] || readDotEnvKey(p.apiKeyEnv) || '';
     }
     args.push(opts.prompt);
     env.CODEX_HOME = opts.guardHome;
