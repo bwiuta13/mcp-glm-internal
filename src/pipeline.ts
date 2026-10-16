@@ -33,6 +33,9 @@ DETAIL: ${t.detail}
 DONE WHEN: ${t.acceptance}
 ${guidance ? `\nThe previous attempt was rejected. Fix exactly this:\n${guidance}\n` : ''}
 Write the code and run the project's tests if a test command exists.
+If the DONE WHEN criterion is ALREADY satisfied by code that exists in the repository right now
+(common when earlier work is sitting uncommitted), do NOT modify anything just to produce a diff:
+reply "already satisfied" and cite the file and line that satisfy it.
 You must NOT run "git commit" or "git push" — they are blocked and will fail.
 Reply with a short summary of what you changed.`;
 
@@ -45,7 +48,13 @@ DONE WHEN: ${t.acceptance}
 DIFF:
 ${diff || '(no changes were made)'}
 
-Judge only whether this diff satisfies the task. Return this exact shape:
+You have READ access to this repository: open the task's files and check the criterion against
+the CURRENT code, not only against the diff.
+If the diff says no changes were made, that does NOT decide the verdict: the work may already
+exist in the repository from before this round (the coder is told to skip no-op edits). If the
+DONE WHEN criterion is already satisfied in the current code, return pass. Only if it is not
+satisfied, return fail with guidance telling the coder exactly what to change.
+Judge only whether the task is satisfied. Return this exact shape:
 {"verdict":"pass","issues":[],"guidance":""}
 or
 {"verdict":"fail","issues":[{"severity":"blocker","file":"a.ts","line":1,"message":"..."}],"guidance":"what to change next round"}
@@ -281,6 +290,14 @@ export async function runPipeline(
           t.state = 'timeout';
           appendEvent(job, { type: 'task.timeout', id: t.item.id, round, role: 'coder' });
           break;
+        }
+
+        // Diff rỗng sau khi coder HOÀN TẤT (không timeout, không snapshot hỏng) thì ghi dấu:
+        // thường là criterion đã được thỏa mãn từ trước nên coder bỏ qua việc sửa (đã đo ở
+        // account/idp: partial work có sẵn → reviewer bị nói dối "no changes" → đốt hết vòng).
+        // Sự kiện này cho người đọc log phân biệt "coder không làm gì" với "việc đã có sẵn".
+        if (!diff && treeBefore && treeAfter) {
+          appendEvent(job, { type: 'task.no_diff', id: t.item.id, round });
         }
 
         t.state = 'reviewing';

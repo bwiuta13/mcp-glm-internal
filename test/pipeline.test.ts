@@ -358,3 +358,79 @@ test('guard home nằm trong gốc của job chứ không rơi vào $HOME', asyn
   );
   releaseJob(job);
 });
+
+// --- Diff rỗng khi việc đã có sẵn: không còn vòng lặp chết ---
+
+test('diff rỗng thì reviewer prompt dặn kiểm tra code hiện tại, và có sự kiện task.no_diff', async () => {
+  // Vá hỏng đã đo thật ở ~/internship/account lẫn idp: repo có sẵn partial work chưa
+  // commit thỏa mãn acceptance → coder không cần đổi gì → diff rỗng → reviewer bị bảo
+  // "(no changes were made)" như thể đó là phán quyết → fail → đốt hết maxRounds →
+  // needs_human. Bây giờ: (1) prompt coder dặn "đã thỏa mãn thì đừng sửa", (2) prompt
+  // reviewer dặn tự mở file kiểm tra criterion trên code HIỆN TẠI, (3) có sự kiện
+  // task.no_diff để log phân biệt "coder không làm gì" với "việc đã có sẵn".
+  chmodSync(SCRIPTED, 0o755);
+  const sd = scriptDir([ONE_TASK, 'da lam roi', PASS]);
+  const { cfg, dir } = cfgWith(sd);
+  const job = createJob('ke hoach', dir, ROOT);
+  await runPipeline(job, cfg);
+
+  assert.equal(job.tasks[0].state, 'passed');
+  const events = readTail(job, 100).map((l) => JSON.parse(l));
+  const noDiff = events.filter((e) => e.type === 'task.no_diff');
+  assert.equal(noDiff.length, 1, 'diff rỗng mà chụp cây khoẻ thì phải có đúng một task.no_diff');
+  assert.equal(noDiff[0].round, 1);
+
+  // Prompt reviewer vòng đó phải dặn kiểm tra code hiện tại chứ không chỉ tin diff
+  const calls = readFileSync(join(sd, 'calls.log'), 'utf8').split('===');
+  const reviewerCall = calls.find((b) => b.includes('You are reviewing one task'));
+  assert.ok(reviewerCall, 'phải có lượt reviewer');
+  // Cụm "already exist" có thể bị xuống dòng ngay giữa chữ — khớp qua ranh giới dòng.
+  assert.match(reviewerCall, /already\s+exist in the repository/, 'dặn rõ diff rỗng chưa chắc là fail');
+  assert.match(reviewerCall, /CURRENT code/);
+
+  // Prompt coder phải dặn "đã thỏa mãn thì đừng sửa chỉ để có diff"
+  const coderCall = calls.find((b) => b.includes('Implement this task'));
+  assert.ok(coderCall, 'phải có lượt coder');
+  assert.match(coderCall, /already satisfied/i);
+  assert.match(coderCall, /do NOT modify anything just to produce a diff/);
+
+  // Đối chứng: có diff thật thì KHÔNG được có sự kiện task.no_diff
+  releaseJob(job);
+});
+
+test('có diff thật thì không có sự kiện task.no_diff', async () => {
+  chmodSync(SCRIPTED, 0o755);
+  const sd = scriptDir([ONE_TASK, 'code', PASS]);
+  const { cfg, dir } = cfgWith(sd);
+  process.env.FAKE_TOUCH = join(dir, 'file-moi.ts');
+  try {
+    const job = createJob('ke hoach', dir, ROOT);
+    await runPipeline(job, cfg);
+    assert.equal(job.tasks[0].state, 'passed');
+    const events = readTail(job, 100).map((l) => JSON.parse(l));
+    assert.ok(!events.some((e) => e.type === 'task.no_diff'), 'có diff mà vẫn báo no_diff');
+    releaseJob(job);
+  } finally {
+    delete process.env.FAKE_TOUCH;
+  }
+});
+
+test('snapshot hỏng thì KHÔNG có sự kiện task.no_diff — đã có snapshot.failed rồi', async () => {
+  // Snapshot hỏng là chuyện khác: diff rỗng lúc đó không nói được gì. task.no_diff chỉ
+  // hợp lệ khi CẢ HAI lần chụp khoẻ — nếu không một cây chụp thất bại cũng sinh no_diff
+  // và người đọc log bị hai sự kiện mâu thuẫn nhau.
+  chmodSync(SCRIPTED, 0o755);
+  const sd = scriptDir([ONE_TASK, 'code', PASS]);
+  const { cfg, dir } = cfgWith(sd);
+  process.env.FAKE_BREAK_GIT = join(dir, '.git');
+  try {
+    const job = createJob('ke hoach', dir, ROOT);
+    await runPipeline(job, cfg);
+    const events = readTail(job, 100).map((l) => JSON.parse(l));
+    assert.ok(events.some((e) => e.type === 'snapshot.failed'));
+    assert.ok(!events.some((e) => e.type === 'task.no_diff'), 'snapshot hỏng mà sinh cả no_diff');
+    releaseJob(job);
+  } finally {
+    delete process.env.FAKE_BREAK_GIT;
+  }
+});
